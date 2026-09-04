@@ -53,6 +53,14 @@ This legacy variable remains the limit used by the Langfuse preset."
 (defcustom gptel-otel-generic-max-bytes nil
   "Optional request body limit for the generic OTLP/HTTP preset."
   :type '(choice (const nil) integer) :group 'gptel-otel)
+(defcustom gptel-otel-langfuse-batch-target-bytes (* 4 1024 1024)
+  "Soft encoded request target for the Langfuse preset.
+An individual span may exceed this target, but not the endpoint hard maximum."
+  :type 'integer :group 'gptel-otel)
+(defcustom gptel-otel-generic-batch-target-bytes (* 4 1024 1024)
+  "Soft encoded request target for the generic OTLP/HTTP preset.
+When a hard maximum is configured, the smaller effective limit is used."
+  :type '(choice (const nil) integer) :group 'gptel-otel)
 (defcustom gptel-otel-generic-account-id "default"
   "Stable non-secret tenant/account identity for generic OTLP delivery."
   :type 'string :group 'gptel-otel)
@@ -87,7 +95,7 @@ traces URL, HEADERS-FUNCTION returns dynamic profile-owned headers,
 MAX-BYTES-FUNCTION returns nil or a request limit, RESPONSE-FUNCTION interprets
 an HTTP response plist, DESTINATION-ID-FUNCTION returns a stable non-secret
 identity, and ATTRIBUTE-PROVIDERS lists semantic attribute provider functions."
-  name endpoint-function headers-function max-bytes-function response-function
+  name endpoint-function headers-function max-bytes-function batch-target-function response-function
   destination-id-function attribute-providers)
 
 (defcustom gptel-otel-backend-profile nil
@@ -201,12 +209,15 @@ or a function returning one."
 
 (defun gptel-otel--generic-max-bytes () gptel-otel-generic-max-bytes)
 (defun gptel-otel--langfuse-max-bytes () gptel-otel-cloud-max-bytes)
+(defun gptel-otel--generic-batch-target-bytes () gptel-otel-generic-batch-target-bytes)
+(defun gptel-otel--langfuse-batch-target-bytes () gptel-otel-langfuse-batch-target-bytes)
 
 (defun gptel-otel--generic-profile ()
   (gptel-otel-make-backend-profile
    :name 'otlp-http :endpoint-function #'gptel-otel--generic-endpoint
    :headers-function #'gptel-otel--generic-profile-headers
    :max-bytes-function #'gptel-otel--generic-max-bytes
+   :batch-target-function #'gptel-otel--generic-batch-target-bytes
    :response-function #'gptel-otel--default-response-interpreter
    :destination-id-function #'gptel-otel--generic-destination-id
    :attribute-providers '(gptel-otel-genai-attribute-provider)))
@@ -216,6 +227,7 @@ or a function returning one."
    :name 'langfuse :endpoint-function #'gptel-otel--langfuse-endpoint
    :headers-function #'gptel-otel--langfuse-profile-headers
    :max-bytes-function #'gptel-otel--langfuse-max-bytes
+   :batch-target-function #'gptel-otel--langfuse-batch-target-bytes
    :response-function #'gptel-otel--langfuse-response-interpreter
    :destination-id-function #'gptel-otel--langfuse-destination-id
    :attribute-providers '(gptel-otel-langfuse-attribute-provider
@@ -238,7 +250,8 @@ or a function returning one."
   (let* ((profile (gptel-otel-active-backend-profile))
          (endpoint (funcall (gptel-otel-backend-profile-endpoint-function profile)))
          (headers-function (gptel-otel-backend-profile-headers-function profile))
-         (limit-function (gptel-otel-backend-profile-max-bytes-function profile)))
+         (limit-function (gptel-otel-backend-profile-max-bytes-function profile))
+         (target-function (gptel-otel-backend-profile-batch-target-function profile)))
     (list :profile-object profile
           :profile (format "%s" (gptel-otel-backend-profile-name profile))
           :endpoint endpoint
@@ -250,6 +263,7 @@ or a function returning one."
                              (equal "content-type" (gptel-otel--header-name header)))
                            (and headers-function (funcall headers-function)))))
           :max-bytes (and limit-function (funcall limit-function))
+          :batch-target-bytes (and target-function (funcall target-function))
           :response-function
           (gptel-otel-backend-profile-response-function profile)
           :destination-id (gptel-otel--profile-destination-id profile endpoint))))
@@ -320,6 +334,13 @@ pass through with first occurrence winning case-insensitively."
       (plist-get gptel-otel--delivery-snapshot :max-bytes)
     (let* ((profile (gptel-otel-active-backend-profile))
            (function (gptel-otel-backend-profile-max-bytes-function profile)))
+      (and function (funcall function)))))
+
+(defun gptel-otel--batch-target-bytes ()
+  (if gptel-otel--delivery-snapshot
+      (plist-get gptel-otel--delivery-snapshot :batch-target-bytes)
+    (let* ((profile (gptel-otel-active-backend-profile))
+           (function (gptel-otel-backend-profile-batch-target-function profile)))
       (and function (funcall function)))))
 
 (defun gptel-otel--destination-mismatch-reason (meta &optional destination-id)
@@ -402,6 +423,103 @@ Return the payload file, or nil for an empty envelope."
       (error (display-warning 'gptel-otel (format "Could not spool trace: %s" err) :warning)
              nil))))
 
+(defun gptel-otel--rollback-group-files (files)
+  "Remove newly-created payload and metadata FILES after local enqueue failure."
+  (dolist (file files)
+    (ignore-errors (when (file-exists-p file) (delete-file file)))
+    (let ((meta (gptel-otel--metadata-file file)))
+      (ignore-errors (when (file-exists-p meta) (delete-file meta))))))
+
+(defun gptel-otel--group-marker-file (group-id)
+  "Return durable readiness marker path for GROUP-ID."
+  (expand-file-name (concat ".group-" group-id ".ready")
+                    gptel-otel-spool-directory))
+
+(defun gptel-otel--group-member-files (group-id)
+  "Return queued payload files belonging to GROUP-ID."
+  (seq-filter
+   (lambda (file)
+     (equal group-id
+            (plist-get (gptel-otel--read-meta file) :export-group-id)))
+   (gptel-otel--entry-files)))
+
+(defun gptel-otel-enqueue-spans (spans)
+  "Build and durably enqueue all encoded request batches for SPANS.
+Return all payload files only after the complete group has been published.
+On local failure, roll back every file newly created for the group."
+  (when spans
+    (condition-case err
+        (let* ((snapshot (gptel-otel--resolve-delivery-snapshot))
+               (hard-max (plist-get snapshot :max-bytes))
+               (target (plist-get snapshot :batch-target-bytes))
+               ;; Fully encode and validate the partition before touching disk.
+               (batches (gptel-otel-export-batches spans target hard-max))
+               (count (length batches))
+               (group-id (gptel-otel-generate-trace-id))
+               (trace-id (gptel-otel-span-trace-id (car spans)))
+               (destination (list :profile (plist-get snapshot :profile)
+                                  :endpoint (plist-get snapshot :redacted-endpoint)
+                                  :destination-id (plist-get snapshot :destination-id)))
+               (stamp (format "%020d" (truncate (* 1000000 (float-time)))))
+               (marker (gptel-otel--group-marker-file group-id))
+               files created)
+          (gptel-otel--ensure-spool)
+          (cl-loop for index from 0 below count do
+                   (let* ((base (format "%s-%s-%04d" stamp group-id index))
+                          (file (expand-file-name (concat base ".json")
+                                                  gptel-otel-spool-directory)))
+                     (when (or (file-exists-p file)
+                               (file-exists-p (gptel-otel--metadata-file file)))
+                       (error "Queue group filename collision"))
+                     (push file files)))
+          (setq files (nreverse files))
+          (condition-case write-error
+              (cl-loop for batch in batches for file in files for index from 0 do
+                       (let* ((oversized (plist-get batch :permanent-oversize))
+                              (span (car (plist-get batch :spans)))
+                              (meta (append
+                                     (list :attempts 0
+                                           :state (if oversized 'permanent 'pending)
+                                           :error (and oversized
+                                                       "individual span exceeds endpoint size limit")
+                                           :bytes (plist-get batch :bytes)
+                                           :trace-id trace-id :export-group-id group-id
+                                           :batch-index index :batch-count count
+                                           :oversize-span-id
+                                           (and oversized (gptel-otel-span-span-id span)))
+                                     destination)))
+                         (gptel-otel--atomic-write
+                          (gptel-otel--metadata-file file) (prin1-to-string meta))
+                         (push file created)
+                         (gptel-otel--atomic-write file (plist-get batch :payload) t)))
+            (error (gptel-otel--rollback-group-files created)
+                   (ignore-errors (delete-file marker))
+                   (signal (car write-error) (cdr write-error))))
+          ;; This marker is the atomic publication point for the whole group.
+          (gptel-otel--atomic-write marker
+                                    (prin1-to-string
+                                     (list :export-group-id group-id
+                                           :batch-count count)))
+          (setq gptel-otel--last-delivery
+                (list :state 'queued :files files :trace-id trace-id
+                      :export-group-id group-id :batch-count count))
+          (when (cl-some (lambda (file)
+                           (eq 'pending (plist-get (gptel-otel--read-meta file) :state)))
+                         files)
+            ;; Durable publication already succeeded.  Scheduling failure must
+            ;; not make callers enqueue the same spans again.
+            (condition-case schedule-error
+                (gptel-otel-flush)
+              (error (display-warning
+                      'gptel-otel
+                      (format "Trace group queued but flush scheduling failed: %s"
+                              schedule-error)
+                      :warning))))
+          files)
+      (error
+       (display-warning 'gptel-otel (format "Could not spool trace group: %s" err) :warning)
+       nil))))
+
 (defun gptel-otel--read-meta (file)
   (condition-case nil
       (with-temp-buffer (insert-file-contents (gptel-otel--metadata-file file))
@@ -434,6 +552,13 @@ explicit confirmation prevents an upgrade from silently rerouting old traces."
 (defun gptel-otel--write-meta (file meta)
   (gptel-otel--atomic-write (gptel-otel--metadata-file file)
                             (prin1-to-string meta)))
+
+(defun gptel-otel--group-ready-p (meta)
+  "Return non-nil when META's whole export group was atomically published.
+Historical one-envelope entries have no group metadata and are always ready."
+  (let ((group-id (plist-get meta :export-group-id)))
+    (or (null group-id)
+        (file-exists-p (gptel-otel--group-marker-file group-id)))))
 
 (defun gptel-otel-status ()
   "Return bounded status for the durable queue."
@@ -494,7 +619,8 @@ can cause a recovered stale lease to be delivered again."
           (gptel-otel--write-meta file meta)
           (setq gptel-otel--last-delivery
                 (list :state 'mismatched :file file :error reason)))
-        (when (and (eq (plist-get meta :state) 'pending) (not reason))
+        (when (and (eq (plist-get meta :state) 'pending) (not reason)
+                   (gptel-otel--group-ready-p meta))
           (let ((lease (format "%s.lease.%s.%s" file (emacs-pid)
                                (gptel-otel-generate-span-id))))
             (condition-case nil
@@ -538,10 +664,15 @@ can cause a recovered stale lease to be delivered again."
                     :file (gptel-otel--base-payload-file lease)))
         (gptel-otel--schedule 0))
        ((plist-get result :ok)
+        (let ((group-id (plist-get meta :export-group-id)))
         (ignore-errors (delete-file lease))
         (ignore-errors (delete-file (gptel-otel--metadata-file lease)))
+        (when (and group-id
+                   (null (gptel-otel--group-member-files group-id)))
+          (ignore-errors
+            (delete-file (gptel-otel--group-marker-file group-id))))
         (setq gptel-otel--last-delivery (list :state 'delivered :status status))
-        (gptel-otel--schedule 0))
+        (gptel-otel--schedule 0)))
        ((gptel-otel-retryable-p status errorp)
         (setq meta (plist-put meta :attempts attempts))
         (setq meta (plist-put meta :error (plist-get result :error)))
@@ -666,8 +797,8 @@ migrating destinations requires explicit payload-level user action."
 (defun gptel-otel-export (spans &optional callback)
   "Durably enqueue ended SPANS, then invoke CALLBACK with queue success."
   (condition-case err
-      (let ((file (and spans (gptel-otel-enqueue (gptel-otel-export-request spans)))))
-        (when callback (funcall callback (and file t))) file)
+      (let ((files (and spans (gptel-otel-enqueue-spans spans))))
+        (when callback (funcall callback (and files t))) files)
     (error (display-warning 'gptel-otel (format "Export failed: %s" err) :warning)
            (when callback (condition-case nil (funcall callback nil) (error nil))) nil)))
 

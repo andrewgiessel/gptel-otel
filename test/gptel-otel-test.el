@@ -70,12 +70,53 @@
                       "langfuse.observation.usage_details"
                       "gen_ai.operation.name"
                       "gen_ai.request.model"
-                      "gen_ai.input.messages"
-                      "gen_ai.output.messages"
                       "gen_ai.usage.input_tokens"
                       "gen_ai.usage.output_tokens"
                       "gen_ai.usage.cache_read_input_tokens"))
-         (should (assoc key (gptel-otel-span-attributes span))))))))
+         (should (assoc key (gptel-otel-span-attributes span))))
+       (should-not (assoc "gen_ai.input.messages"
+                          (gptel-otel-span-attributes span)))
+       (should-not (assoc "gen_ai.output.messages"
+                          (gptel-otel-span-attributes span)))))))
+
+(ert-deftest gptel-otel-langfuse-content-has-one-canonical-complete-copy ()
+  (gptel-otel-test--isolated
+   (let* ((input '(:messages [(:role "user" :content "INPUT-SENTINEL")]))
+          (info (list :data input :model 'model :callback #'ignore))
+          (fsm (gptel-otel-test--fsm info 'WAIT)))
+     (gptel-otel--instrument-request fsm)
+     (gptel-otel--before-wait fsm)
+     (let ((span (gptel-otel--context-current-generation
+                  (gptel-otel--context fsm))))
+       (gptel-otel--generation-callback span #'ignore "OUTPUT-SENTINEL" info)
+       (gptel-otel--finish-generation fsm)
+       (let* ((attrs (gptel-otel-span-attributes span))
+              (encoded (json-encode (gptel-otel-export-request (list span)))))
+         (should (assoc "langfuse.observation.input" attrs))
+         (should (assoc "langfuse.observation.output" attrs))
+         (should-not (assoc "gen_ai.input.messages" attrs))
+         (should-not (assoc "gen_ai.output.messages" attrs))
+         (let ((start 0) (count 0))
+           (while (string-match "INPUT-SENTINEL" encoded start)
+             (setq count (1+ count) start (match-end 0)))
+           (should (= 1 count))))))))
+
+(ert-deftest gptel-otel-generic-profile-keeps-complete-genai-content ()
+  (gptel-otel-test--isolated
+   (let ((gptel-otel-backend-profile 'otlp-http))
+     (let* ((info (list :data '(:messages ["GENERIC-INPUT"]) :model 'm
+                        :callback #'ignore))
+            (fsm (gptel-otel-test--fsm info)))
+       (gptel-otel--instrument-request fsm)
+       (gptel-otel--before-wait fsm)
+       (let ((span (gptel-otel--context-current-generation
+                    (gptel-otel--context fsm))))
+         (gptel-otel--generation-callback span #'ignore "GENERIC-OUTPUT" info)
+         (gptel-otel--finish-generation fsm)
+         (should (assoc "gen_ai.input.messages" (gptel-otel-span-attributes span)))
+         (should (assoc "gen_ai.output.messages" (gptel-otel-span-attributes span)))
+         (should-not (assoc "langfuse.observation.input"
+                            (gptel-otel-span-attributes span))))))))
 
 (ert-deftest gptel-otel-custom-semantic-provider-is-used-by-lifecycle ()
   (gptel-otel-test--isolated
@@ -180,8 +221,8 @@
      (gptel-otel--before-pre-tool fsm)
      (let* ((context (gptel-otel--context fsm))
             (span (gethash call (gptel-otel--context-tool-spans context))))
-       (cl-letf (((symbol-function 'gptel-otel-enqueue)
-                  (lambda (_request) (setq queued t) "queued")))
+       (cl-letf (((symbol-function 'gptel-otel-enqueue-spans)
+                  (lambda (_spans) (setq queued t) '("queued"))))
          (gptel-otel--finalize fsm 'ABRT)
          (should queued)
          (should (gptel-otel-span-ended-p span))
@@ -240,12 +281,27 @@
      (let* ((context (progn (gptel-otel--instrument-request fsm)
                             (gptel-otel--context fsm)))
             (root (gptel-otel--context-root context)))
-       (cl-letf (((symbol-function 'gptel-otel-enqueue)
-                  (lambda (_request) (setq count (1+ (or count 0))) "queued")))
+       (cl-letf (((symbol-function 'gptel-otel-enqueue-spans)
+                  (lambda (_spans) (setq count (1+ (or count 0))) '("queued"))))
          (gptel-otel--finalize fsm 'ABRT)
          (gptel-otel--finalize fsm 'ABRT)
          (should (= 1 count))
          (should (equal 2 (cdr (assq 'code (gptel-otel-span-status root))))))))))
+
+(ert-deftest gptel-otel-group-enqueue-failure-keeps-adapter-state ()
+  (gptel-otel-test--isolated
+   (let* ((fsm (gptel-otel-test--fsm
+                (list :data "in" :model 'm :callback #'ignore :status "failed")
+                'ABRT)))
+     (gptel-otel--instrument-request fsm)
+     (let* ((context (gptel-otel--context fsm))
+            (trace (gptel-otel--context-trace context)))
+       (cl-letf (((symbol-function 'gptel-otel-enqueue-spans)
+                  (lambda (_spans) nil)))
+         (gptel-otel--finalize fsm 'ABRT)
+         (should-not (gptel-otel-trace-queued-p trace))
+         (should (eq context (gptel-otel--context fsm)))
+         (should (gptel-otel-trace-spans trace)))))))
 
 (ert-deftest gptel-otel-root-waits-for-late-agent-callback-and-cleans-up ()
   (gptel-otel-test--isolated
@@ -265,8 +321,8 @@
               (lambda (cb _type _desc _prompt)
                 (setq callback cb) (gptel-otel-test--fsm))
               #'ignore "researcher" "desc" "prompt"))
-       (cl-letf (((symbol-function 'gptel-otel-enqueue)
-                  (lambda (value) (setq request value) "queued")))
+       (cl-letf (((symbol-function 'gptel-otel-enqueue-spans)
+                  (lambda (value) (setq request value) '("queued"))))
          (gptel-otel--finalize parent 'DONE)
          (should-not request)
          (funcall callback "done")
@@ -385,7 +441,8 @@
             (root (gptel-otel--context-root context))
             (generation (gptel-otel--context-current-generation context)))
        (should (equal "chat model" (gptel-otel-span-name generation)))
-       (cl-letf (((symbol-function 'gptel-otel-enqueue) (lambda (_request) "queued")))
+       (cl-letf (((symbol-function 'gptel-otel-enqueue-spans)
+                  (lambda (_spans) '("queued"))))
          (gptel-otel--finish-generation fsm)
          (gptel-otel--finalize fsm 'DONE)
          (let* ((input-value (cdr (assoc "langfuse.observation.input"

@@ -146,7 +146,11 @@ Fall back to DATA only when no provider message collection can be identified."
          (input-tokens (gptel-otel--token-value tokens :input :input_tokens :prompt))
          (output-tokens (gptel-otel--token-value tokens :output :output_tokens :completion))
          (cache-tokens (gptel-otel--token-value tokens :cache :cache_read
-                                                :cache_read_input_tokens)))
+                                                :cache_read_input_tokens))
+         (langfuse-p
+          (eq 'langfuse
+              (gptel-otel-backend-profile-name
+               (gptel-otel-active-backend-profile)))))
     (delq nil
           (append
            (cond
@@ -171,14 +175,18 @@ Fall back to DATA only when no provider message collection can be identified."
                                                (plist-get tool :name))
                       (gptel-otel--string-attr "gen_ai.tool.call.id"
                                                (plist-get tool :id))))
-           ;; Portable message fields apply only to model generations.  Keep
-           ;; Langfuse's complete payload attributes on all observation kinds.
-           (and (equal type "generation") gptel-otel-capture-payloads input
+           (and (equal type "agent")
+                (list (gptel-otel--string-attr
+                       "gen_ai.agent.name" (plist-get input :type))))
+           ;; The generic profile uses portable content as its canonical full
+           ;; representation for every logical operation.  Langfuse uses only
+           ;; langfuse.observation.input/output for those bodies.
+           (and (not langfuse-p) gptel-otel-capture-payloads input
                 (list (cons "gen_ai.input.messages"
                             (gptel-otel-value-array
                              (gptel-otel-value-string
                               (gptel-otel--serialize input))))))
-           (and (equal type "generation") gptel-otel-capture-payloads output
+           (and (not langfuse-p) gptel-otel-capture-payloads output
                 (list (cons "gen_ai.output.messages"
                             (gptel-otel-value-array
                              (gptel-otel-value-string
@@ -556,7 +564,7 @@ awaiting confirmation."
     (let ((spans (cl-remove-if-not #'gptel-otel-span-ended-p
                                    (gptel-otel-trace-spans trace))))
       (when spans
-        (when (gptel-otel-enqueue (gptel-otel-export-request spans))
+        (when (gptel-otel-enqueue-spans spans)
           (dolist (span spans) (setf (gptel-otel-span-exported-p span) t))
           (setf (gptel-otel-trace-queued-p trace) t)
           (gptel-otel--release-trace-state trace spans))))))

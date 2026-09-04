@@ -20,6 +20,21 @@
     (gptel-otel-end-span span)
     (gptel-otel-export-request (list span))))
 
+(defun gptel-otel-test--ended-span (name payload &optional parent)
+  (let ((span (gptel-otel-start-span
+               name parent `(("payload" . ,(gptel-otel-value-string payload))))))
+    (gptel-otel-end-span span)
+    span))
+
+(defun gptel-otel-test--request-spans (file)
+  (let* ((request (json-parse-string
+                   (with-temp-buffer (insert-file-contents file) (buffer-string))
+                   :object-type 'alist :array-type 'list :null-object nil
+                   :false-object :json-false))
+         (resource (car (alist-get 'resourceSpans request)))
+         (scope (car (alist-get 'scopeSpans resource))))
+    (alist-get 'spans scope)))
+
 (ert-deftest gptel-otel-queue-persists-private-and-replays ()
   (gptel-otel-test--with-spool
    (let ((gptel-otel-delivery-function (lambda (_payload _callback) nil)))
@@ -131,6 +146,79 @@
      (let ((file (gptel-otel-enqueue
                   (gptel-otel-test--request (make-string 500 ?x)))))
        (should (eq 'permanent (plist-get (gptel-otel--read-meta file) :state)))))))
+
+(ert-deftest gptel-otel-trace-batches-by-encoded-bytes-preserving-tree ()
+  (gptel-otel-test--with-spool
+   (let* ((gptel-otel-backend-profile 'otlp-http)
+          (gptel-otel-generic-batch-target-bytes 950)
+          (gptel-otel-generic-max-bytes 1200)
+          (gptel-otel-delivery-function (lambda (&rest _)))
+          (root (gptel-otel-test--ended-span "root" (make-string 120 ?r)))
+          (child-a (gptel-otel-test--ended-span "a" (make-string 120 ?a) root))
+          (child-b (gptel-otel-test--ended-span "b" (make-string 120 ?b) root))
+          (spans (list root child-a child-b))
+          (files (gptel-otel-enqueue-spans spans)))
+     (when gptel-otel--delivery-active
+       (gptel-otel--release-lease (plist-get gptel-otel--delivery-active :lease))
+       (setq gptel-otel--delivery-active nil))
+     (should (> (length files) 1))
+     (let ((ids nil) (parents nil) (trace-ids nil)
+           (group-ids nil) (counts nil) (indexes nil))
+       (dolist (file files)
+         (should (< (file-attribute-size (file-attributes file))
+                    gptel-otel-generic-max-bytes))
+         (let ((meta (gptel-otel--read-meta file)))
+           (push (plist-get meta :export-group-id) group-ids)
+           (push (plist-get meta :batch-count) counts)
+           (push (plist-get meta :batch-index) indexes))
+         (dolist (span-json (gptel-otel-test--request-spans file))
+           (push (alist-get 'spanId span-json) ids)
+           (push (alist-get 'traceId span-json) trace-ids)
+           (when (alist-get 'parentSpanId span-json)
+             (push (cons (alist-get 'spanId span-json)
+                         (alist-get 'parentSpanId span-json)) parents))))
+       (should (= 3 (length ids)))
+       (should (= 3 (length (delete-dups (copy-sequence ids)))))
+       (should (= 1 (length (delete-dups trace-ids))))
+       (should (= 1 (length (delete-dups group-ids))))
+       (should (equal (number-sequence 0 (1- (length files))) (sort indexes #'<)))
+       (should (cl-every (lambda (count) (= count (length files))) counts))
+       (should (equal (gptel-otel-span-span-id root)
+                      (cdr (assoc (gptel-otel-span-span-id child-a) parents))))
+       (should (equal (gptel-otel-span-span-id root)
+                      (cdr (assoc (gptel-otel-span-span-id child-b) parents))))))))
+
+(ert-deftest gptel-otel-single-oversized-span-is-retained-permanent ()
+  (gptel-otel-test--with-spool
+   (let* ((gptel-otel-backend-profile 'otlp-http)
+          (gptel-otel-generic-batch-target-bytes 500)
+          (gptel-otel-generic-max-bytes 600)
+          (span (gptel-otel-test--ended-span "huge" (make-string 2000 ?z)))
+          (file (car (gptel-otel-enqueue-spans (list span))))
+          (meta (gptel-otel--read-meta file)))
+     (should (file-exists-p file))
+     (should (eq 'permanent (plist-get meta :state)))
+     (should (equal (gptel-otel-span-span-id span)
+                    (plist-get meta :oversize-span-id)))
+     (should (string-match-p (make-string 100 ?z)
+                             (with-temp-buffer
+                               (insert-file-contents file) (buffer-string)))))))
+
+(ert-deftest gptel-otel-group-enqueue-failure-rolls-back-and-reports-failure ()
+  (gptel-otel-test--with-spool
+   (let* ((gptel-otel-backend-profile 'otlp-http)
+          (gptel-otel-generic-batch-target-bytes 800)
+          (spans (list (gptel-otel-test--ended-span "a" (make-string 200 ?a))
+                       (gptel-otel-test--ended-span "b" (make-string 200 ?b))))
+          (writes 0)
+          (real-write (symbol-function 'gptel-otel--atomic-write)))
+     (cl-letf (((symbol-function 'gptel-otel--atomic-write)
+                (lambda (file content &optional literal)
+                  (setq writes (1+ writes))
+                  (if (= writes 4) (error "injected group failure")
+                    (funcall real-write file content literal)))))
+       (should-not (gptel-otel-enqueue-spans spans)))
+     (should-not (directory-files dir nil "\\.json\\|\\.meta")))))
 
 (ert-deftest gptel-otel-queue-destination-mismatch-is-visible ()
   (gptel-otel-test--with-spool
@@ -273,5 +361,52 @@
 
 (ert-deftest gptel-otel-queue-no-empty-envelope ()
   (gptel-otel-test--with-spool (should-not (gptel-otel-enqueue nil))))
+
+(ert-deftest gptel-otel-multibatch-group-delivers-every-member ()
+  (gptel-otel-test--with-spool
+   (let ((gptel-otel-backend-profile 'otlp-http)
+         (gptel-otel-endpoint "https://collector.test/v1/traces")
+         (gptel-otel-generic-batch-target-bytes 900)
+         (gptel-otel-generic-max-bytes 1400)
+         callbacks delivered)
+     (let ((gptel-otel-delivery-function
+            (lambda (payload callback)
+              (push payload delivered)
+              (setq callbacks (append callbacks (list callback))))))
+       (let* ((root (gptel-otel-test--ended-span "root" (make-string 180 ?r)))
+              (a (gptel-otel-test--ended-span "a" (make-string 180 ?a) root))
+              (b (gptel-otel-test--ended-span "b" (make-string 180 ?b) root))
+              (files (gptel-otel-enqueue-spans (list root a b)))
+              (group-id (plist-get (gptel-otel--read-meta (car files))
+                                   :export-group-id))
+              (marker (gptel-otel--group-marker-file group-id)))
+         (should (> (length files) 1))
+         (should (file-exists-p marker))
+         (while (or callbacks gptel-otel--delivery-active)
+           (when callbacks
+             (let ((callback (pop callbacks)))
+               (funcall callback '(:ok t :status 200))))
+           (when (timerp gptel-otel--delivery-timer)
+             (cancel-timer gptel-otel--delivery-timer)
+             (setq gptel-otel--delivery-timer nil))
+           (unless gptel-otel--delivery-active (gptel-otel-flush)))
+         (should (= (length files) (length delivered)))
+         (dolist (file files) (should-not (file-exists-p file)))
+         (should-not (file-exists-p marker)))))))
+
+(ert-deftest gptel-otel-incomplete-group-marker-blocks-delivery ()
+  (gptel-otel-test--with-spool
+   (let ((gptel-otel-delivery-function (lambda (&rest _) (error "must not send"))))
+     (gptel-otel--ensure-spool)
+     (let* ((file (expand-file-name "incomplete.json" dir))
+            (destination (gptel-otel--destination))
+            (meta (append '(:attempts 0 :state pending
+                            :export-group-id "incomplete" :batch-count 2)
+                          destination)))
+       (gptel-otel--write-private file "{}" t)
+       (gptel-otel--write-meta file meta)
+       (should-not (gptel-otel--claim-next
+                    (plist-get destination :destination-id)))
+       (should (file-exists-p file))))))
 
 (provide 'gptel-otel-transport-test)

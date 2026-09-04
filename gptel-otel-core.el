@@ -156,6 +156,49 @@ Emacs 27 builds whose fixnums cannot represent a nanosecond epoch integer."
          (scopeSpans . [((scope . ((name . "gptel-otel") (version . "0.3.0")))
                          (spans . ,(vconcat (mapcar #'gptel-otel--span-json spans))))]))]))))
 
+(defun gptel-otel--encoded-request (spans)
+  "Return (REQUEST PAYLOAD BYTES) for SPANS, encoded as OTLP JSON UTF-8."
+  (let* ((request (gptel-otel-export-request spans))
+         (payload (encode-coding-string (json-encode request) 'utf-8)))
+    (list request payload (string-bytes payload))))
+
+(defun gptel-otel-export-batches (spans &optional target-bytes hard-max-bytes)
+  "Partition ended SPANS into encoded OTLP request batches.
+TARGET-BYTES is a soft request target.  HARD-MAX-BYTES is a strict endpoint
+limit: ordinary batches are smaller than it.  A single span that cannot fit is
+returned alone with `:permanent-oversize' non-nil so its complete payload can
+be retained durably.  Spans are never split, truncated, duplicated, or
+reordered.  Each result is a plist containing :request, :payload, :bytes,
+:spans, and :permanent-oversize."
+  (unless spans (error "Refusing to create empty trace batches"))
+  (let* ((hard-target hard-max-bytes)
+         (target (cond ((and target-bytes hard-target)
+                        (min target-bytes hard-target))
+                       (target-bytes target-bytes)
+                       (hard-target hard-target)))
+         current results)
+    (when (and target (<= target 0))
+      (error "Request byte limits must leave room for an envelope"))
+    (cl-labels
+        ((entry (batch)
+           (pcase-let ((`(,request ,payload ,bytes)
+                        (gptel-otel--encoded-request batch)))
+             (list :request request :payload payload :bytes bytes :spans batch
+                   :permanent-oversize
+                   (and hard-max-bytes (> bytes hard-max-bytes)))))
+         (emit (batch) (push (entry batch) results)))
+      (dolist (span spans)
+        (let* ((candidate (append current (list span)))
+               (candidate-entry (entry candidate)))
+          (if (or (null target)
+                  (<= (plist-get candidate-entry :bytes) target)
+                  (null current))
+              (setq current candidate)
+            (emit current)
+            (setq current (list span)))))
+      (when current (emit current)))
+    (nreverse results)))
+
 (defun gptel-otel-trace-request (trace)
   "Return one request containing every ended, not-yet-exported span in TRACE."
   (let ((spans (cl-remove-if-not
