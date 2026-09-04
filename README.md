@@ -10,7 +10,7 @@ This package is pre-1.0 and depends on signature-guarded private gptel and gptel
 
 - Emacs 29.1 or later
 - gptel 0.9.9 or later
-- gptel-agent `20260824.106` or a compatible later revision
+- gptel-agent `0.0.1` from a current development snapshot (tested with `20260824.106`)
 
 If a private function signature changes, the affected instrumentation layer is disabled with a warning instead of changing gptel control flow. Compatibility still needs to be verified when upgrading gptel or gptel-agent.
 

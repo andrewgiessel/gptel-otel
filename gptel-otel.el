@@ -4,7 +4,7 @@
 ;; Author: Andrew Giessel <andrew.giessel@gmail.com>
 ;; Maintainer: Andrew Giessel <andrew.giessel@gmail.com>
 ;; Version: 0.3.0
-;; Package-Requires: ((emacs "29.1") (gptel "0.9.9") (gptel-agent "20260824.106"))
+;; Package-Requires: ((emacs "29.1") (gptel "0.9.9") (gptel-agent "0.0.1"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/andrewgiessel/gptel-otel
 
