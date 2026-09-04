@@ -2,9 +2,11 @@
 
 ;; Copyright (C) 2026 Andrew Giessel
 ;; Author: Andrew Giessel
+;; Maintainer: Andrew Giessel <andrew.giessel@gmail.com>
 ;; Version: 0.3.0
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: tools, processes
+;; URL: https://github.com/andrewgiessel/gptel-otel
 
 ;;; Commentary:
 ;; Typed OTLP span construction and trace collection.  Transport and durable
@@ -109,14 +111,14 @@ Emacs 27 builds whose fixnums cannot represent a nanosecond epoch integer."
   (append '((code . 2)) (and message `((message . ,(format "%s" message))))))
 
 (defun gptel-otel-trace-create (root-name &optional attributes)
-  "Create a trace with root span ROOT-NAME."
+  "Create a trace with ROOT-NAME and optional typed ATTRIBUTES."
   (let* ((root (gptel-otel-start-span root-name nil attributes))
          (trace (gptel-otel--make-trace :id (gptel-otel-span-trace-id root)
                                         :root root :spans nil)))
     (setf (gptel-otel-trace-spans trace) (list root)) trace))
 
 (defun gptel-otel-trace-start-span (trace name parent attributes)
-  "Start and register a span in TRACE."
+  "Start NAME in TRACE under PARENT with typed ATTRIBUTES."
   (let ((span (gptel-otel-start-span name (or parent (gptel-otel-trace-root trace))
                                      attributes (gptel-otel-trace-id trace))))
     (setf (gptel-otel-trace-spans trace)

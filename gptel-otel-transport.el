@@ -1,8 +1,16 @@
 ;;; gptel-otel-transport.el --- Durable OTLP delivery  -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026 Andrew Giessel
+;; Author: Andrew Giessel <andrew.giessel@gmail.com>
+;; Maintainer: Andrew Giessel <andrew.giessel@gmail.com>
 ;; Version: 0.3.0
 ;; Package-Requires: ((emacs "27.1"))
+;; Keywords: tools, processes
+;; URL: https://github.com/andrewgiessel/gptel-otel
+
+;;; Commentary:
+;; Backend profiles, durable private spooling, byte-aware OTLP batching, and
+;; asynchronous OTLP/HTTP JSON delivery for `gptel-otel'.
 
 ;;; Code:
 
@@ -526,6 +534,7 @@ On local failure, roll back every file newly created for the group."
                         (read (current-buffer)))
     (error (list :attempts 0 :state 'pending))))
 
+;;;###autoload
 (defun gptel-otel-migrate-legacy-queue (expected-destination-id)
   "Stamp destination-less queue entries for EXPECTED-DESTINATION-ID.
 The caller must supply the currently configured destination ID exactly; this
@@ -560,6 +569,7 @@ Historical one-envelope entries have no group metadata and are always ready."
     (or (null group-id)
         (file-exists-p (gptel-otel--group-marker-file group-id)))))
 
+;;;###autoload
 (defun gptel-otel-status ()
   "Return bounded status for the durable queue."
   (let ((files (gptel-otel--entry-files)) (pending 0) (permanent 0)
@@ -697,6 +707,7 @@ can cause a recovered stale lease to be delivered again."
   (gptel-otel--finish-delivery
    token lease '(:ok nil :connection-error t :error "delivery callback timed out")))
 
+;;;###autoload
 (defun gptel-otel-flush ()
   "Asynchronously attempt delivery of the next queued trace.
 Queue delivery has at-least-once semantics, including a duplicate crash window
@@ -729,6 +740,7 @@ between endpoint acceptance and deletion of the claimed local entry."
            (gptel-otel--finish-delivery
             token lease (list :ok nil :connection-error t :error err)))))))))
 
+;;;###autoload
 (defun gptel-otel-replay (&optional include-permanent)
   "Replay queued traces; with INCLUDE-PERMANENT reset safe permanent failures.
 Partial-success and destination-mismatched entries are deliberately not reset:

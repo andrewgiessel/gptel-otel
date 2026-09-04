@@ -4,13 +4,26 @@
 (require 'gptel-otel)
 
 (defmacro gptel-otel-test--isolated (&rest body)
-  `(let ((gptel-otel--contexts (make-hash-table :test #'eq))
-         (gptel-otel-backend-profile 'langfuse)
-         (gptel-otel--span-data (make-hash-table :test #'eq))
-         (gptel-otel-trace-metadata-function
-          (lambda (_fsm) (list :name "trace" :session-id "session"
-                               :user-id "user" :tags ["one" "two"]))))
-     (let ((gptel-otel--user-turn t)) ,@body)))
+  `(let* ((spool (make-temp-file "gptel-otel-instrumentation-test" t))
+          (gptel-otel-spool-directory spool)
+          (gptel-otel--delivery-active nil)
+          (gptel-otel--delivery-timer nil)
+          (gptel-otel--watchdog-timer nil)
+          (gptel-otel-delivery-function (lambda (_payload _callback) nil))
+          (gptel-otel--contexts (make-hash-table :test #'eq))
+          (gptel-otel-capture-payloads t)
+          (gptel-otel-backend-profile 'langfuse)
+          (gptel-otel--span-data (make-hash-table :test #'eq))
+          (gptel-otel-trace-metadata-function
+           (lambda (_fsm) (list :name "trace" :session-id "session"
+                                :user-id "user" :tags ["one" "two"]))))
+     (unwind-protect
+         (let ((gptel-otel--user-turn t)) ,@body)
+       (when (timerp gptel-otel--delivery-timer)
+         (cancel-timer gptel-otel--delivery-timer))
+       (when (timerp gptel-otel--watchdog-timer)
+         (cancel-timer gptel-otel--watchdog-timer))
+       (delete-directory spool t))))
 
 (defun gptel-otel-test--fsm (&optional info state)
   (gptel-make-fsm :info (or info (list :data '(:messages ["input"])
@@ -308,7 +321,7 @@
    (let* ((call (list :id "agent" :name "Agent" :args nil))
           (parent (gptel-otel-test--fsm
                    (list :data nil :model 'm :callback #'ignore :tool-use (list call))))
-          callback child request)
+          callback child requests)
      (gptel-otel--instrument-request parent)
      (gptel-otel--before-pre-tool parent)
      (let* ((context (gptel-otel--context parent))
@@ -322,13 +335,15 @@
                 (setq callback cb) (gptel-otel-test--fsm))
               #'ignore "researcher" "desc" "prompt"))
        (cl-letf (((symbol-function 'gptel-otel-enqueue-spans)
-                  (lambda (value) (setq request value) '("queued"))))
+                  (lambda (value) (push value requests) '("queued"))))
          (gptel-otel--finalize parent 'DONE)
-         (should-not request)
+         (should-not requests)
          (funcall callback "done")
-         (should-not request)
+         ;; Completed child observations are exported immediately, even while
+         ;; the root waits for the Agent tool to finish.
+         (should (= 1 (length requests)))
          (gptel-otel--finish-tool parent call "done" nil)
-         (should request)
+         (should (>= (length requests) 2))
          (should (gptel-otel-trace-queued-p trace))
          (should-not (gptel-otel--context parent))
          (should-not (gptel-otel--context child))
@@ -467,5 +482,71 @@
        (should (equal "execute_tool Bash" (gptel-otel-span-name tool)))
        (should (equal (gptel-otel-span-span-id root)
                       (gptel-otel-span-parent-span-id tool)))))))
+
+(ert-deftest gptel-otel-stock-agent-tool-integration ()
+  (let ((agent-tool (gptel-get-tool '("gptel-agent" "Agent"))))
+    (should agent-tool)
+    (should (eq (gptel-tool-function agent-tool) #'gptel-agent--task))
+    (should (= 3 (length (gptel-tool-args agent-tool))))
+    (unwind-protect
+        (progn
+          (gptel-otel-mode 1)
+          (should (advice-member-p #'gptel-otel--around-agent-task
+                                   'gptel-agent--task)))
+      (gptel-otel-mode -1))))
+
+(ert-deftest gptel-otel-repeated-wait-closes-displaced-generation ()
+  (gptel-otel-test--isolated
+   (let* ((fsm (gptel-otel-test--fsm))
+          exported)
+     (gptel-otel--instrument-request fsm)
+     (gptel-otel--before-wait fsm)
+     (let* ((context (gptel-otel--context fsm))
+            (first (gptel-otel--context-current-generation context)))
+       (cl-letf (((symbol-function 'gptel-otel-enqueue-spans)
+                  (lambda (spans) (push spans exported) '("queued"))))
+         (gptel-otel--before-wait fsm)
+         (should (gptel-otel-span-ended-p first))
+         (should (gptel-otel-span-exported-p first))
+         (should (= 1 (length exported)))
+         (should-not
+          (eq first (gptel-otel--context-current-generation context))))))))
+
+(ert-deftest gptel-otel-terminal-reconciles-all-generations ()
+  (gptel-otel-test--isolated
+   (let* ((fsm (gptel-otel-test--fsm nil 'DONE)))
+     (gptel-otel--instrument-request fsm)
+     (gptel-otel--before-wait fsm)
+     (let* ((context (gptel-otel--context fsm))
+            (trace (gptel-otel--context-trace context))
+            (first (gptel-otel--context-current-generation context))
+            (orphan (gptel-otel-trace-start-span
+                     trace "chat orphan" (gptel-otel--context-root context) nil)))
+       (setf (gptel-otel--context-generations context)
+             (append (gptel-otel--context-generations context) (list orphan)))
+       (cl-letf (((symbol-function 'gptel-otel-enqueue-spans)
+                  (lambda (_spans) '("queued"))))
+         (gptel-otel--finalize fsm 'DONE)
+         (should (gptel-otel-span-ended-p first))
+         (should (gptel-otel-span-ended-p orphan))
+         (should (zerop (gptel-otel-trace-outstanding trace))))))))
+
+(ert-deftest gptel-otel-cleanup-stale-terminal-contexts ()
+  (gptel-otel-test--isolated
+   (let* ((fsm (gptel-otel-test--fsm nil 'DONE)))
+     (gptel-otel--instrument-request fsm)
+     (gptel-otel--before-wait fsm)
+     (let* ((context (gptel-otel--context fsm))
+            (trace (gptel-otel--context-trace context))
+            (generation (gptel-otel--context-current-generation context))
+            (root (gptel-otel-trace-root trace)))
+       (cl-letf (((symbol-function 'gptel-otel-enqueue-spans)
+                  (lambda (_spans) '("queued"))))
+         (should (= 1 (gptel-otel-cleanup-stale-contexts)))
+         (should (gptel-otel-span-ended-p generation))
+         (should (gptel-otel-span-ended-p root))
+         (should (gptel-otel-trace-terminal-p trace))
+         (should (zerop (gptel-otel-trace-outstanding trace)))
+         (should-not (gptel-otel--context fsm)))))))
 
 (provide 'gptel-otel-test)

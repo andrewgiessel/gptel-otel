@@ -1,11 +1,25 @@
 ;;; gptel-otel.el --- OpenTelemetry instrumentation for gptel  -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026 Andrew Giessel
+;; Author: Andrew Giessel <andrew.giessel@gmail.com>
+;; Maintainer: Andrew Giessel <andrew.giessel@gmail.com>
 ;; Version: 0.3.0
-;; Package-Requires: ((emacs "27.1") (gptel "0.9"))
+;; Package-Requires: ((emacs "29.1") (gptel "0.9.9") (gptel-agent "0"))
+;; Keywords: convenience, tools
+;; URL: https://github.com/andrewgiessel/gptel-otel
 
 ;;; Commentary:
-;; Root, generation, tool and subagent spans for guarded gptel seams.
+;; OpenTelemetry tracing for stock gptel and gptel-agent.  The global minor
+;; mode records one trace per gptel request, with nested model-generation,
+;; tool-execution, and subagent observations.  Completed spans are durably
+;; spooled and exported via OTLP/HTTP JSON.  Langfuse is the polished default
+;; backend profile; generic OTLP/HTTP collectors are also supported.
+;;
+;; gptel currently lacks public lifecycle hooks with all required correlation
+;; data.  This package therefore uses signature-guarded private seams and
+;; disables only an incompatible instrumentation layer when a seam changes.
+;;
+;; See the repository README for installation, privacy, and operation details.
 
 ;;; Code:
 
@@ -13,10 +27,11 @@
 (require 'json)
 (require 'subr-x)
 (require 'gptel)
+(require 'gptel-agent)
 (require 'gptel-otel-core)
 (require 'gptel-otel-transport)
 
-(defcustom gptel-otel-capture-payloads t
+(defcustom gptel-otel-capture-payloads nil
   "When non-nil retain complete logical inputs and outputs; never truncate."
   :type 'boolean :group 'gptel-otel)
 (defcustom gptel-otel-trace-metadata-function #'gptel-otel-default-trace-metadata
@@ -242,7 +257,7 @@ Fall back to DATA only when no provider message collection can be identified."
   (gethash fsm gptel-otel--contexts))
 
 (defun gptel-otel--instrument-request (fsm)
-  "Public prompt transformer establishing one root per request."
+  "Establish one trace root for the request represented by FSM."
   (condition-case err
       (when (and gptel-otel--user-turn
                  (not (gptel-otel--context fsm))
@@ -287,8 +302,16 @@ Fall back to DATA only when no provider message collection can be identified."
              (context (or (gptel-otel--context fsm)
                           (and agent parent-context
                                (gptel-otel--new-context fsm parent-context agent))
-                          (gptel-otel--new-context fsm)))
-             (info (gptel-fsm-info fsm))
+                          (gptel-otel--new-context fsm))))
+        ;; Never silently displace an unended generation on a repeated WAIT.
+        (when-let* ((previous (gptel-otel--context-current-generation context))
+                    ((not (gptel-otel-span-ended-p previous))))
+          (gptel-otel-trace-end-span
+           (gptel-otel--context-trace context) previous
+           (gptel-otel-status-error "generation replaced before completion"))
+          (setf (gptel-otel--context-current-generation context) nil)
+          (gptel-otel--maybe-export (gptel-otel--context-trace context)))
+        (let* ((info (gptel-fsm-info fsm))
              (parent (or agent (gptel-otel--context-root context)))
              (input (plist-get info :data))
              (attrs (gptel-otel--observation-attributes context "generation" input nil))
@@ -302,7 +325,7 @@ Fall back to DATA only when no provider message collection can be identified."
               (append (gptel-otel--context-generations context) (list span)))
         (when (functionp callback)
           (plist-put info :callback
-                     (apply-partially #'gptel-otel--generation-callback span callback))))
+                     (apply-partially #'gptel-otel--generation-callback span callback)))))
     (error (display-warning 'gptel-otel (format "Generation start failed: %s" err) :warning)))
   nil)
 
@@ -319,7 +342,19 @@ Fall back to DATA only when no provider message collection can be identified."
        (if (plist-get info :error)
            (gptel-otel-status-error (plist-get info :status))
          (gptel-otel-status-ok)))
-      (setf (gptel-otel--context-current-generation context) nil))))
+      (setf (gptel-otel--context-current-generation context) nil)
+      (gptel-otel--maybe-export (gptel-otel--context-trace context)))))
+
+(defun gptel-otel--reconcile-generation-spans (fsm &optional reason)
+  "Finish every unended generation owned by FSM with error REASON."
+  (when-let* ((context (gptel-otel--context fsm)))
+    (dolist (span (gptel-otel--context-generations context))
+      (unless (gptel-otel-span-ended-p span)
+        (gptel-otel-trace-end-span
+         (gptel-otel--context-trace context) span
+         (gptel-otel-status-error (or reason "generation abandoned")))))
+    (setf (gptel-otel--context-current-generation context) nil)
+    (gptel-otel--maybe-export (gptel-otel--context-trace context))))
 
 (defun gptel-otel--around-transition (orig machine &optional new-state)
   (let ((old-state (gptel-fsm-state machine)) result)
@@ -395,7 +430,7 @@ Fall back to DATA only when no provider message collection can be identified."
 (defun gptel-otel--reconcile-tool-spans (fsm &optional terminal)
   "Finish tool spans for FSM that bypassed the normal result seam.
 A call that disappeared from `:tool-use' was consumed internally by gptel
-(currently its structured-output ersatz tool).  At TERMINAL, any remaining
+\(currently its structured-output ersatz tool).  At TERMINAL, any remaining
 open call is conservatively recorded as abandoned.  Nonterminal calls still
 present without results are left open because they may be asynchronous or
 awaiting confirmation."
@@ -432,6 +467,7 @@ awaiting confirmation."
         (gptel-otel--finish-tool fsm (nth 0 entry) (nth 1 entry) (nth 2 entry))))))
 
 (defun gptel-otel--around-tool-use (orig fsm)
+  "Call ORIG for FSM while retaining exact parent and tool lifecycles."
   (let ((gptel-otel--parent-fsm fsm)
         result)
     (unwind-protect
@@ -446,7 +482,7 @@ awaiting confirmation."
     result))
 
 (defun gptel-otel--around-map-tool-args (orig tool-spec args)
-  "Bind the exact Agent call represented by ARGS immediately before execution."
+  "Call ORIG with TOOL-SPEC and ARGS, binding the exact Agent call."
   (prog1 (funcall orig tool-spec args)
     (when (equal (gptel-tool-name tool-spec) "Agent")
       (setq gptel-otel--next-agent-execution
@@ -523,6 +559,10 @@ awaiting confirmation."
     (setf (gptel-otel--context-terminal-p context) t)
     (when-let* ((generation (gptel-otel--context-current-generation context)))
       (gptel-otel--finish-generation fsm))
+    ;; Terminal fallback for generations displaced by unusual FSM paths,
+    ;; reloads, aborts, or callback failures.
+    (gptel-otel--reconcile-generation-spans
+     fsm (format "request terminated in %s" terminal))
     ;; Confirmation can be canceled and transport errors can terminate a
     ;; request before every tool reaches `gptel--process-tool-call'.  Closing
     ;; those spans here prevents one abandoned call from suppressing the trace.
@@ -541,7 +581,7 @@ awaiting confirmation."
         (gptel-otel--maybe-export (gptel-otel--context-trace context))))))
 
 (defun gptel-otel--release-trace-state (trace spans)
-  "Release completed adapter state for TRACE after durable enqueue."
+  "Release completed TRACE and SPANS state after durable enqueue."
   (maphash (lambda (fsm context)
              (when (eq trace (gptel-otel--context-trace context))
                (maphash (lambda (call _span)
@@ -554,20 +594,79 @@ awaiting confirmation."
   (setf (gptel-otel-trace-spans trace) nil))
 
 (defun gptel-otel--maybe-export (trace)
-  "Durably enqueue TRACE once root is terminal and no operations remain."
-  (when (and (gptel-otel-trace-terminal-p trace)
-             (zerop (gptel-otel-trace-outstanding trace)))
-    (gptel-otel--export-trace trace)))
+  "Durably enqueue ended, unexported spans from TRACE.
+Child observations are exported incrementally.  A terminal root is exported
+after all outstanding operations are reconciled."
+  (let ((spans
+         (cl-remove-if-not
+          (lambda (span)
+            (and (gptel-otel-span-ended-p span)
+                 (not (gptel-otel-span-exported-p span))
+                 (or (not (eq span (gptel-otel-trace-root trace)))
+                     (and (gptel-otel-trace-terminal-p trace)
+                          (zerop (gptel-otel-trace-outstanding trace))))))
+          (gptel-otel-trace-spans trace))))
+    (when (and spans (gptel-otel-enqueue-spans spans))
+      (dolist (span spans)
+        (setf (gptel-otel-span-exported-p span) t)
+        (remhash span gptel-otel--span-data))
+      (when (and (gptel-otel-trace-terminal-p trace)
+                 (zerop (gptel-otel-trace-outstanding trace))
+                 (gptel-otel-span-exported-p (gptel-otel-trace-root trace)))
+        (setf (gptel-otel-trace-queued-p trace) t)
+        (gptel-otel--release-trace-state
+         trace (gptel-otel-trace-spans trace))))))
 
 (defun gptel-otel--export-trace (trace)
+  "Export all currently eligible observations from TRACE."
   (unless (gptel-otel-trace-queued-p trace)
-    (let ((spans (cl-remove-if-not #'gptel-otel-span-ended-p
-                                   (gptel-otel-trace-spans trace))))
-      (when spans
-        (when (gptel-otel-enqueue-spans spans)
-          (dolist (span spans) (setf (gptel-otel-span-exported-p span) t))
-          (setf (gptel-otel-trace-queued-p trace) t)
-          (gptel-otel--release-trace-state trace spans))))))
+    (gptel-otel--maybe-export trace)))
+
+;;;###autoload
+(defun gptel-otel-cleanup-stale-contexts ()
+  "Reconcile and export retained contexts whose FSMs are terminal.
+This is safe to run after reloads or interrupted callbacks.  Active requests
+are left unchanged.  Return the number of terminal contexts examined."
+  (interactive)
+  (let (terminal traces (count 0))
+    (maphash
+     (lambda (fsm context)
+       (when (or (gptel-otel--context-terminal-p context)
+                 (memq (gptel-fsm-state fsm) '(DONE ERRS ABRT)))
+         (push (cons fsm context) terminal)))
+     gptel-otel--contexts)
+    (dolist (entry terminal)
+      (pcase-let ((`(,fsm . ,context) entry))
+        (cl-incf count)
+        (gptel-otel--reconcile-generation-spans
+         fsm "stale terminal generation")
+        (gptel-otel--reconcile-tool-spans fsm (gptel-fsm-state fsm))
+        (let* ((trace (gptel-otel--context-trace context))
+               (root (gptel-otel--context-root context)))
+          ;; Only the real trace root is finalized here.  Child contexts share
+          ;; an agent span whose callback owns its terminal output/status.
+          (when (and (eq root (gptel-otel-trace-root trace))
+                     (not (gptel-otel-span-ended-p root)))
+            (let ((info (gptel-fsm-info fsm)))
+              (gptel-otel--set-semantic-attributes
+               root :kind 'root-finish :type "span"
+               :input (gptel-otel--latest-user-input (plist-get info :data))
+               :output (gptel-otel--response-text info) :info info)
+              (gptel-otel-end-span
+               root
+               (if (eq (gptel-fsm-state fsm) 'DONE)
+                   (gptel-otel-status-ok)
+                 (gptel-otel-status-error
+                  (or (plist-get info :status)
+                      (format "%s" (gptel-fsm-state fsm))))))
+              (setf (gptel-otel-trace-terminal-p trace) t))))
+        (cl-pushnew (gptel-otel--context-trace context) traces :test #'eq)))
+    (dolist (trace traces)
+      (gptel-otel--maybe-export trace))
+    (when (called-interactively-p 'interactive)
+      (message "gptel-otel examined %d terminal context%s"
+               count (if (= count 1) "" "s")))
+    count))
 
 (defconst gptel-otel--guarded-seams
   '((gptel-send (&optional arg) gptel-otel--around-send :around root)
@@ -585,16 +684,15 @@ awaiting confirmation."
 (defun gptel-otel--setup-advice ()
   (dolist (seam gptel-otel--guarded-seams)
     (pcase-let ((`(,symbol ,args ,advice ,where ,layer) seam))
-      (when (or (not (eq layer 'agent)) (require 'gptel-agent-tools nil t))
-        (if (gptel-otel--signature-equal-p symbol args)
-            (unless (advice-member-p advice symbol)
-              (advice-add symbol where advice)
-              (push (cons symbol advice) gptel-otel--installed-advices))
-          (display-warning 'gptel-otel
-                           (format "%s instrumentation disabled: %s signature is %S, expected %S"
-                                   layer symbol (and (fboundp symbol)
-                                                     (help-function-arglist symbol t)) args)
-                           :warning))))))
+      (if (gptel-otel--signature-equal-p symbol args)
+          (unless (advice-member-p advice symbol)
+            (advice-add symbol where advice)
+            (push (cons symbol advice) gptel-otel--installed-advices))
+        (display-warning 'gptel-otel
+                         (format "%s instrumentation disabled: %s signature is %S, expected %S"
+                                 layer symbol (and (fboundp symbol)
+                                                   (help-function-arglist symbol t)) args)
+                         :warning)))))
 
 (defun gptel-otel--teardown-advice ()
   (dolist (pair gptel-otel--installed-advices)
@@ -609,6 +707,7 @@ awaiting confirmation."
       (progn
         (add-hook 'gptel-prompt-transform-functions #'gptel-otel--instrument-request t)
         (gptel-otel--setup-advice)
+        (gptel-otel-cleanup-stale-contexts)
         (gptel-otel-replay))
     (remove-hook 'gptel-prompt-transform-functions #'gptel-otel--instrument-request)
     (gptel-otel--teardown-advice)))
