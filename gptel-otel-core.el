@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2026 Andrew Giessel
 ;; Author: Andrew Giessel
-;; Version: 0.2.0
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: tools, processes
 
@@ -153,7 +153,7 @@ Emacs 27 builds whose fixnums cannot represent a nanosecond epoch integer."
                      (assoc-delete-all "service.name" gptel-otel-resource-attributes))))
     `((resourceSpans .
        [((resource . ((attributes . ,(gptel-otel--attributes attrs))))
-         (scopeSpans . [((scope . ((name . "gptel-otel") (version . "0.2.0")))
+         (scopeSpans . [((scope . ((name . "gptel-otel") (version . "0.3.0")))
                          (spans . ,(vconcat (mapcar #'gptel-otel--span-json spans))))]))]))))
 
 (defun gptel-otel-trace-request (trace)

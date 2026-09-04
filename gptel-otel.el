@@ -1,7 +1,7 @@
 ;;; gptel-otel.el --- OpenTelemetry instrumentation for gptel  -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026 Andrew Giessel
-;; Version: 0.2.0
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "27.1") (gptel "0.9"))
 
 ;;; Commentary:
@@ -28,6 +28,11 @@ can filter as trace metadata."
 (defcustom gptel-otel-model-parameters-function #'gptel-otel-default-model-parameters
   "Function called with request INFO, returning model parameters."
   :type 'function :group 'gptel-otel)
+(defcustom gptel-otel-attribute-provider-functions nil
+  "Semantic attribute providers, or nil to use the backend profile defaults.
+Each function receives an event plist and returns typed attribute cons cells.
+This separates gptel lifecycle capture from backend and semantic conventions."
+  :type '(repeat function) :group 'gptel-otel)
 
 (cl-defstruct (gptel-otel--context (:constructor gptel-otel--make-context))
   trace root current-generation generations tool-spans metadata terminal-p)
@@ -58,7 +63,7 @@ can filter as trace metadata."
 (defun gptel-otel--string-attr (key value)
   (and value (cons key (gptel-otel-value-string value))))
 
-(defun gptel-otel--context-attributes (metadata)
+(defun gptel-otel--langfuse-context-attributes (metadata)
   (delq nil
         (append
          (list (gptel-otel--string-attr "langfuse.trace.name" (plist-get metadata :name))
@@ -73,16 +78,115 @@ can filter as trace metadata."
                     (concat "langfuse.trace.metadata." (car entry)) (cdr entry)))
                  (plist-get metadata :metadata)))))
 
-(defun gptel-otel--observation-attributes (context type &optional input output)
-  (append (gptel-otel--context-attributes (gptel-otel--context-metadata context))
-          (delq nil
-                (list (gptel-otel--string-attr "langfuse.observation.type" type)
-                      (and gptel-otel-capture-payloads input
-                           (gptel-otel--string-attr "langfuse.observation.input"
-                                                   (gptel-otel--serialize input)))
-                      (and gptel-otel-capture-payloads output
-                           (gptel-otel--string-attr "langfuse.observation.output"
-                                                   (gptel-otel--serialize output)))))))
+(defun gptel-otel-langfuse-attribute-provider (event)
+  "Return Langfuse attributes for lifecycle EVENT."
+  (let ((kind (plist-get event :kind)) (metadata (plist-get event :metadata))
+        (type (plist-get event :type)) (input (plist-get event :input))
+        (output (plist-get event :output)) (info (plist-get event :info)))
+    (delq nil
+          (append
+           (and (memq kind '(root-start observation-start))
+                (gptel-otel--langfuse-context-attributes metadata))
+           (and type (list (gptel-otel--string-attr "langfuse.observation.type" type)))
+           (and gptel-otel-capture-payloads input
+                (list (gptel-otel--string-attr "langfuse.observation.input"
+                                               (gptel-otel--serialize input))))
+           (and gptel-otel-capture-payloads output
+                (list (gptel-otel--string-attr "langfuse.observation.output"
+                                               (gptel-otel--serialize output))))
+           (and (eq kind 'generation-finish)
+                (list (gptel-otel--string-attr "langfuse.observation.model.name"
+                                               (plist-get info :model))
+                      (gptel-otel--string-attr
+                       "langfuse.observation.model.parameters"
+                       (gptel-otel--serialize
+                        (funcall gptel-otel-model-parameters-function info)))
+                      (and (plist-get info :tokens)
+                           (gptel-otel--string-attr
+                            "langfuse.observation.usage_details"
+                            (gptel-otel--serialize (plist-get info :tokens))))))))))
+
+(defun gptel-otel--token-value (tokens &rest keys)
+  (catch 'value
+    (dolist (key keys)
+      (when (and (listp tokens) (plist-member tokens key))
+        (throw 'value (plist-get tokens key))))))
+
+(defun gptel-otel-genai-attribute-provider (event)
+  "Return portable OpenTelemetry GenAI attributes for lifecycle EVENT."
+  (let* ((kind (plist-get event :kind)) (type (plist-get event :type))
+         (input (plist-get event :input)) (output (plist-get event :output))
+         (info (plist-get event :info)) (tool (plist-get event :tool-call))
+         (tokens (plist-get info :tokens))
+         (input-tokens (gptel-otel--token-value tokens :input :input_tokens :prompt))
+         (output-tokens (gptel-otel--token-value tokens :output :output_tokens :completion))
+         (cache-tokens (gptel-otel--token-value tokens :cache :cache_read
+                                                :cache_read_input_tokens)))
+    (delq nil
+          (append
+           (cond
+            ((equal type "generation")
+             (list (gptel-otel--string-attr "gen_ai.operation.name" "chat")))
+            ((equal type "tool")
+             (list (gptel-otel--string-attr "gen_ai.operation.name" "execute_tool")))
+            ((equal type "agent")
+             (list (gptel-otel--string-attr "gen_ai.operation.name" "invoke_agent"))))
+           (and (eq kind 'generation-finish)
+                (list (gptel-otel--string-attr "gen_ai.request.model"
+                                               (plist-get info :model))
+                      (and input-tokens (cons "gen_ai.usage.input_tokens"
+                                              (gptel-otel-value-int input-tokens)))
+                      (and output-tokens (cons "gen_ai.usage.output_tokens"
+                                               (gptel-otel-value-int output-tokens)))
+                      (and cache-tokens
+                           (cons "gen_ai.usage.cache_read_input_tokens"
+                                 (gptel-otel-value-int cache-tokens)))))
+           (and tool
+                (list (gptel-otel--string-attr "gen_ai.tool.name"
+                                               (plist-get tool :name))
+                      (gptel-otel--string-attr "gen_ai.tool.call.id"
+                                               (plist-get tool :id))))
+           ;; Portable message fields apply only to model generations.  Keep
+           ;; Langfuse's complete payload attributes on all observation kinds.
+           (and (equal type "generation") gptel-otel-capture-payloads input
+                (list (cons "gen_ai.input.messages"
+                            (gptel-otel-value-array
+                             (gptel-otel-value-string
+                              (gptel-otel--serialize input))))))
+           (and (equal type "generation") gptel-otel-capture-payloads output
+                (list (cons "gen_ai.output.messages"
+                            (gptel-otel-value-array
+                             (gptel-otel-value-string
+                              (gptel-otel--serialize output))))))))))
+
+(defun gptel-otel--attribute-providers ()
+  (or gptel-otel-attribute-provider-functions
+      (gptel-otel-backend-profile-attribute-providers
+       (gptel-otel-active-backend-profile))))
+
+(defun gptel-otel--semantic-attributes (&rest event)
+  "Run configured providers for EVENT, containing provider failures."
+  (let (attributes)
+    (dolist (provider (gptel-otel--attribute-providers))
+      (condition-case err
+          ;; Later providers have deterministic precedence.
+          (dolist (attribute (funcall provider event))
+            (when attribute
+              (setq attributes
+                    (cons attribute (assoc-delete-all (car attribute) attributes)))))
+        (error (display-warning 'gptel-otel
+                                (format "Attribute provider %s failed: %s" provider err)
+                                :warning))))
+    (nreverse attributes)))
+
+(defun gptel-otel--set-semantic-attributes (span &rest event)
+  (dolist (attribute (apply #'gptel-otel--semantic-attributes event))
+    (when attribute (gptel-otel-span-set-attribute span (car attribute) (cdr attribute)))))
+
+(defun gptel-otel--observation-attributes (context type &optional input output tool-call)
+  (gptel-otel--semantic-attributes
+   :kind 'observation-start :metadata (gptel-otel--context-metadata context)
+   :type type :input input :output output :tool-call tool-call))
 
 (defun gptel-otel--new-context (fsm &optional parent-context parent-span)
   (let* ((metadata (condition-case nil
@@ -91,9 +195,8 @@ can filter as trace metadata."
          (root-name (or (plist-get metadata :name) "gptel.chat"))
          (trace (if parent-context (gptel-otel--context-trace parent-context)
                   (gptel-otel-trace-create
-                   root-name (append (gptel-otel--context-attributes metadata)
-                                     `(("langfuse.observation.type" .
-                                        ,(gptel-otel-value-string "span")))))))
+                   root-name (gptel-otel--semantic-attributes
+                              :kind 'root-start :metadata metadata :type "span"))))
          (root (if parent-context parent-span (gptel-otel-trace-root trace)))
          (context (gptel-otel--make-context
                    :trace trace :root root :tool-spans (make-hash-table :test #'eq)
@@ -173,23 +276,9 @@ can filter as trace metadata."
               (span (gptel-otel--context-current-generation context))
               ((not (gptel-otel-span-ended-p span))))
     (let* ((info (gptel-fsm-info fsm))
-           (output (gptel-otel-span-get-output span))
-           (tokens (plist-get info :tokens)))
-      (when gptel-otel-capture-payloads
-        (gptel-otel-span-set-attribute
-         span "langfuse.observation.output"
-         (gptel-otel-value-string (gptel-otel--serialize output))))
-      (gptel-otel-span-set-attribute
-       span "langfuse.observation.model.name"
-       (gptel-otel-value-string (format "%s" (plist-get info :model))))
-      (gptel-otel-span-set-attribute
-       span "langfuse.observation.model.parameters"
-       (gptel-otel-value-string
-        (gptel-otel--serialize (funcall gptel-otel-model-parameters-function info))))
-      (when tokens
-        (gptel-otel-span-set-attribute
-         span "langfuse.observation.usage_details"
-         (gptel-otel-value-string (gptel-otel--serialize tokens))))
+           (output (gptel-otel-span-get-output span)))
+      (gptel-otel--set-semantic-attributes
+       span :kind 'generation-finish :type "generation" :output output :info info)
       (gptel-otel-trace-end-span
        (gptel-otel--context-trace context) span
        (if (plist-get info :error)
@@ -228,7 +317,7 @@ can filter as trace metadata."
                          (or (car (last (gptel-otel--context-generations context)))
                              (gptel-otel--context-root context))
                          (append (gptel-otel--observation-attributes
-                                  context "tool" (plist-get call :args) nil)
+                                  context "tool" (plist-get call :args) nil call)
                                  (and (plist-get call :id)
                                       `(("tool.call.id" .
                                          ,(gptel-otel-value-string (plist-get call :id)))))))))
@@ -256,10 +345,8 @@ can filter as trace metadata."
   (condition-case telemetry-error
       (when-let* ((context (gptel-otel--context fsm))
                   (span (gethash tool-call (gptel-otel--context-tool-spans context))))
-        (when gptel-otel-capture-payloads
-          (gptel-otel-span-set-attribute span "langfuse.observation.output"
-                                         (gptel-otel-value-string
-                                          (gptel-otel--serialize result))))
+        (gptel-otel--set-semantic-attributes
+         span :kind 'observation-finish :type "tool" :output result :tool-call tool-call)
         ;; String results are intentionally not inferred to be exceptions.
         (gptel-otel-trace-end-span
          (gptel-otel--context-trace context) span
@@ -333,10 +420,8 @@ awaiting confirmation."
   (prog1 (funcall original value)
     (condition-case err
         (progn
-          (when gptel-otel-capture-payloads
-            (gptel-otel-span-set-attribute span "langfuse.observation.output"
-                                           (gptel-otel-value-string
-                                            (gptel-otel--serialize value))))
+          (gptel-otel--set-semantic-attributes
+           span :kind 'observation-finish :type "agent" :output value)
           (gptel-otel-trace-end-span
            (gptel-otel--context-trace context) span
            (if (and (stringp value) (string-prefix-p "Error:" value))
@@ -405,14 +490,9 @@ awaiting confirmation."
     (let ((root (gptel-otel--context-root context)) (info (gptel-fsm-info fsm)))
       ;; Child contexts share an agent span as root; its callback owns that span.
       (when (eq root (gptel-otel-trace-root (gptel-otel--context-trace context)))
-        (when gptel-otel-capture-payloads
-          (gptel-otel-span-set-attribute root "langfuse.observation.input"
-                                         (gptel-otel-value-string
-                                          (gptel-otel--serialize (plist-get info :data))))
-          (gptel-otel-span-set-attribute root "langfuse.observation.output"
-                                         (gptel-otel-value-string
-                                          (gptel-otel--serialize
-                                           (gptel-otel--response-text info)))))
+        (gptel-otel--set-semantic-attributes
+         root :kind 'root-finish :type "span" :input (plist-get info :data)
+         :output (gptel-otel--response-text info) :info info)
         (gptel-otel-end-span root (if (eq terminal 'DONE) (gptel-otel-status-ok)
                                    (gptel-otel-status-error (or (plist-get info :status)
                                                                (format "%s" terminal)))))

@@ -5,6 +5,7 @@
 
 (defmacro gptel-otel-test--isolated (&rest body)
   `(let ((gptel-otel--contexts (make-hash-table :test #'eq))
+         (gptel-otel-backend-profile 'langfuse)
          (gptel-otel--span-data (make-hash-table :test #'eq))
          (gptel-otel-trace-metadata-function
           (lambda (_fsm) (list :name "trace" :session-id "session"
@@ -51,6 +52,42 @@
      (gptel-otel--before-wait fsm)
      (should (= 2 (length (gptel-otel--context-generations
                            (gptel-otel--context fsm))))))))
+
+(ert-deftest gptel-otel-langfuse-preset-emits-langfuse-and-portable-attributes ()
+  (gptel-otel-test--isolated
+   (let* ((info (list :data '(:messages ["hello"]) :model 'model-x
+                      :tokens '(:input 3 :output 4 :cache_read 2)
+                      :callback #'ignore))
+          (fsm (gptel-otel-test--fsm info 'WAIT)))
+     (gptel-otel--instrument-request fsm)
+     (gptel-otel--before-wait fsm)
+     (let ((span (gptel-otel--context-current-generation
+                  (gptel-otel--context fsm))))
+       (gptel-otel--generation-callback span #'ignore "answer" info)
+       (gptel-otel--finish-generation fsm)
+       (dolist (key '("langfuse.observation.output"
+                      "langfuse.observation.model.name"
+                      "langfuse.observation.usage_details"
+                      "gen_ai.operation.name"
+                      "gen_ai.request.model"
+                      "gen_ai.input.messages"
+                      "gen_ai.output.messages"
+                      "gen_ai.usage.input_tokens"
+                      "gen_ai.usage.output_tokens"
+                      "gen_ai.usage.cache_read_input_tokens"))
+         (should (assoc key (gptel-otel-span-attributes span))))))))
+
+(ert-deftest gptel-otel-custom-semantic-provider-is-used-by-lifecycle ()
+  (gptel-otel-test--isolated
+   (let ((gptel-otel-attribute-provider-functions
+          (list (lambda (event)
+                  (list (cons "community.kind"
+                              (gptel-otel-value-string (plist-get event :kind))))))))
+     (let ((fsm (gptel-otel-test--fsm)))
+       (gptel-otel--instrument-request fsm)
+       (should (assoc "community.kind"
+                      (gptel-otel-span-attributes
+                       (gptel-otel--context-root (gptel-otel--context fsm)))))))))
 
 (ert-deftest gptel-otel-generation-callback-forwards-optional-raw ()
   (gptel-otel-test--isolated

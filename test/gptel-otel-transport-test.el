@@ -97,6 +97,123 @@
                              :key (lambda (h) (downcase (car h))) :test #'equal)))
       (should (equal "yes" (cdr (assoc "X-Extra" headers)))))))
 
+(ert-deftest gptel-otel-generic-authorization-and-custom-headers-pass-through ()
+  (let ((gptel-otel-backend-profile 'otlp-http)
+        (gptel-otel-headers-function
+         (lambda () '(("Authorization" . "Bearer token")
+                      ("x-honeycomb-team" . "team")
+                      ("X-Tenant-ID" . "tenant")
+                      ("authorization" . "Basic ignored")))))
+    (let ((headers (gptel-otel-http-headers)))
+      (should (equal "Bearer token" (cdr (assoc "Authorization" headers))))
+      (should (equal "team" (cdr (assoc "x-honeycomb-team" headers))))
+      (should (equal "tenant" (cdr (assoc "X-Tenant-ID" headers))))
+      (should (= 1 (cl-count "authorization" headers
+                             :key (lambda (h) (downcase (car h))) :test #'equal))))))
+
+(ert-deftest gptel-otel-langfuse-required-headers-win-and-dedupe ()
+  (let ((gptel-otel-backend-profile 'langfuse)
+        (gptel-otel-langfuse-auth-function (lambda () '("pk" . "sk")))
+        (gptel-otel-headers-function
+         (lambda () '(("Authorization" . "Bearer bad")
+                      ("X-Langfuse-Ingestion-Version" . "bad")
+                      ("X-Tenant" . "kept")))))
+    (let ((headers (gptel-otel-http-headers)))
+      (should (equal (concat "Basic " (base64-encode-string "pk:sk" t))
+                     (cdr (assoc "Authorization" headers))))
+      (should (equal "4" (cdr (assoc "x-langfuse-ingestion-version" headers))))
+      (should (equal "kept" (cdr (assoc "X-Tenant" headers)))))))
+
+(ert-deftest gptel-otel-generic-byte-limit-is-enforced ()
+  (gptel-otel-test--with-spool
+   (let ((gptel-otel-backend-profile 'otlp-http)
+         (gptel-otel-generic-max-bytes 100))
+     (let ((file (gptel-otel-enqueue
+                  (gptel-otel-test--request (make-string 500 ?x)))))
+       (should (eq 'permanent (plist-get (gptel-otel--read-meta file) :state)))))))
+
+(ert-deftest gptel-otel-queue-destination-mismatch-is-visible ()
+  (gptel-otel-test--with-spool
+   (let ((gptel-otel-backend-profile 'otlp-http)
+         (gptel-otel-endpoint "https://one.test/v1/traces")
+         (gptel-otel-delivery-function (lambda (&rest _))))
+     (let ((file (gptel-otel-enqueue (gptel-otel-test--request))))
+       (when gptel-otel--delivery-active
+         (gptel-otel--release-lease (plist-get gptel-otel--delivery-active :lease))
+         (setq gptel-otel--delivery-active nil))
+       (let ((gptel-otel-endpoint "https://two.test/v1/traces"))
+         (should-not (gptel-otel--claim-next))
+         (let ((meta (gptel-otel--read-meta file)))
+           (should (eq 'mismatched (plist-get meta :state)))
+           (should (string-match-p "destination mismatch" (plist-get meta :error)))
+           (should (= 1 (plist-get (gptel-otel-status) :mismatched)))))))))
+
+(ert-deftest gptel-otel-same-endpoint-different-account-is-mismatched ()
+  (gptel-otel-test--with-spool
+   (let ((gptel-otel-backend-profile 'otlp-http)
+         (gptel-otel-endpoint "https://collector.test/v1/traces")
+         (gptel-otel-generic-account-id "tenant-a")
+         (gptel-otel-delivery-function (lambda (&rest _))))
+     (let ((file (gptel-otel-enqueue (gptel-otel-test--request))))
+       (when gptel-otel--delivery-active
+         (gptel-otel--release-lease (plist-get gptel-otel--delivery-active :lease))
+         (setq gptel-otel--delivery-active nil))
+       (let ((gptel-otel-generic-account-id "tenant-b"))
+         (should-not (gptel-otel--claim-next))
+         (should (eq 'mismatched
+                     (plist-get (gptel-otel--read-meta file) :state))))))))
+
+(ert-deftest gptel-otel-legacy-queue-requires-explicit-migration ()
+  (gptel-otel-test--with-spool
+   (let ((gptel-otel-delivery-function (lambda (&rest _))))
+     (gptel-otel--ensure-spool)
+     (let* ((file (expand-file-name "legacy.json" dir))
+            (meta (gptel-otel--metadata-file file))
+            (destination-id (plist-get (gptel-otel--destination) :destination-id)))
+       (gptel-otel--write-private file "{}" t)
+       (gptel-otel--write-private meta "(:attempts 0 :state pending)")
+       (should-not (gptel-otel--claim-next))
+       (should-error (gptel-otel-migrate-legacy-queue "wrong"))
+       (should (= 1 (gptel-otel-migrate-legacy-queue destination-id)))
+       (should (equal destination-id
+                      (plist-get (gptel-otel--read-meta file) :destination-id)))))))
+
+(ert-deftest gptel-otel-otlp-partial-success-is-preserved ()
+  (let ((result (gptel-otel--default-response-interpreter
+                 '(:ok t :status 200
+                   :body "{\"partialSuccess\":{\"rejectedSpans\":2,\"errorMessage\":\"bad spans\"}}"))))
+    (should-not (plist-get result :ok))
+    (should (plist-get result :partial))
+    (should (= 2 (plist-get result :rejected-spans)))
+    (should (equal "bad spans" (plist-get result :error)))))
+
+(ert-deftest gptel-otel-otlp-partial-success-zero-and-snake-case ()
+  (should (plist-get
+           (gptel-otel--default-response-interpreter
+            '(:ok t :status 200 :body "{\"partialSuccess\":{\"rejectedSpans\":0}}"))
+           :ok))
+  (let ((result (gptel-otel--default-response-interpreter
+                 '(:ok t :status 200
+                   :body "{\"partial_success\":{\"rejected_spans\":\"3\",\"error_message\":\"bad\"}}"))))
+    (should (plist-get result :partial))
+    (should (equal "3" (plist-get result :rejected-spans)))))
+
+(ert-deftest gptel-otel-profile-is-extensible ()
+  (let* ((profile (gptel-otel-make-backend-profile
+                   :name 'community
+                   :endpoint-function (lambda () "https://community.test/traces")
+                   :headers-function (lambda () '(("X-Community" . "yes")))
+                   :max-bytes-function (lambda () 123)
+                   :response-function #'identity
+                   :destination-id-function
+                   (lambda (_profile _endpoint) "community:stable")))
+         (gptel-otel-backend-profile profile))
+    (should (equal "https://community.test/traces" (gptel-otel--endpoint)))
+    (should (= 123 (gptel-otel--max-request-bytes)))
+    (should (equal "community:stable"
+                   (plist-get (gptel-otel--destination) :destination-id)))
+    (should (equal "yes" (cdr (assoc "X-Community" (gptel-otel-http-headers)))))))
+
 (ert-deftest gptel-otel-unicode-bytes-persist-literally ()
   (gptel-otel-test--with-spool
    (let ((gptel-otel-delivery-function (lambda (_payload _callback) nil))
