@@ -308,7 +308,7 @@ Fall back to DATA only when no provider message collection can be identified."
                     ((not (gptel-otel-span-ended-p previous))))
           (gptel-otel-trace-end-span
            (gptel-otel--context-trace context) previous
-           (gptel-otel-status-error "generation replaced before completion"))
+           (gptel-otel-status-error "Generation replaced before completion"))
           (setf (gptel-otel--context-current-generation context) nil)
           (gptel-otel--maybe-export (gptel-otel--context-trace context)))
         (let* ((info (gptel-fsm-info fsm))
@@ -352,7 +352,7 @@ Fall back to DATA only when no provider message collection can be identified."
       (unless (gptel-otel-span-ended-p span)
         (gptel-otel-trace-end-span
          (gptel-otel--context-trace context) span
-         (gptel-otel-status-error (or reason "generation abandoned")))))
+         (gptel-otel-status-error (or reason "Generation abandoned")))))
     (setf (gptel-otel--context-current-generation context) nil)
     (gptel-otel--maybe-export (gptel-otel--context-trace context))))
 
@@ -639,7 +639,7 @@ are left unchanged.  Return the number of terminal contexts examined."
       (pcase-let ((`(,fsm . ,context) entry))
         (cl-incf count)
         (gptel-otel--reconcile-generation-spans
-         fsm "stale terminal generation")
+         fsm "Stale terminal generation")
         (gptel-otel--reconcile-tool-spans fsm (gptel-fsm-state fsm))
         (let* ((trace (gptel-otel--context-trace context))
                (root (gptel-otel--context-root context)))

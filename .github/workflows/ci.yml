@@ -23,7 +23,7 @@ jobs:
           - "30.1"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: purcell/setup-emacs@v5.0
         with:
@@ -41,22 +41,17 @@ jobs:
             --eval "(package-install 'gptel-agent)" \
             --eval "(package-install 'package-lint)"
 
-      - name: Discover package paths
-        run: |
-          echo "GPTEL_DIR=$(find .ci-elpa -maxdepth 1 -type d -name 'gptel-*' ! -name 'gptel-agent-*' | head -1)" >> "$GITHUB_ENV"
-          echo "GPTEL_AGENT_DIR=$(find .ci-elpa -maxdepth 1 -type d -name 'gptel-agent-*' | head -1)" >> "$GITHUB_ENV"
-          echo "PACKAGE_LINT_DIR=$(find .ci-elpa -maxdepth 1 -type d -name 'package-lint-*' | head -1)" >> "$GITHUB_ENV"
-
       - name: Test and compile
         run: |
-          make clean test compile GPTEL_DIR="$GPTEL_DIR" GPTEL_AGENT_DIR="$GPTEL_AGENT_DIR"
+          make clean test compile ELPA_DIR=.ci-elpa
 
       - name: Check documentation
         run: |
-          emacs -Q --batch -L . -L "$GPTEL_DIR" -L "$GPTEL_AGENT_DIR" \
+          emacs -Q --batch \
+            --eval "(progn (require 'package) (setq package-user-dir (expand-file-name \".ci-elpa\")) (package-initialize))" \
+            -L . \
             --eval "(progn (require 'checkdoc) (let ((checkdoc-force-docstrings-flag nil)) (checkdoc-file \"gptel-otel-core.el\") (checkdoc-file \"gptel-otel-transport.el\") (checkdoc-file \"gptel-otel.el\")))"
 
       - name: Package lint
         run: |
-          emacs -Q --batch -L . -L "$GPTEL_DIR" -L "$GPTEL_AGENT_DIR" -L "$PACKAGE_LINT_DIR" \
-            -f package-lint-batch-and-exit gptel-otel.el
+          make lint ELPA_DIR=.ci-elpa
