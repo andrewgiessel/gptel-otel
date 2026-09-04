@@ -814,5 +814,37 @@ migrating destinations requires explicit payload-level user action."
     (error (display-warning 'gptel-otel (format "Export failed: %s" err) :warning)
            (when callback (condition-case nil (funcall callback nil) (error nil))) nil)))
 
+;;;###autoload
+(defun gptel-otel-purge-queue (states)
+  "Delete queued entries whose state is a member of STATES.
+STATES must not contain `pending'; active or retryable telemetry must be
+handled through `gptel-otel-flush' or `gptel-otel-replay'.  Interactively,
+prompt before deleting permanent, partial, and destination-mismatched entries.
+Return the number of payload entries removed."
+  (interactive
+   (list
+    (when (yes-or-no-p
+           "Delete permanent, partial, and mismatched gptel-otel entries? ")
+      '(permanent partial mismatched))))
+  (when (memq 'pending states)
+    (user-error "Refusing to purge pending telemetry"))
+  (let ((count 0) groups)
+    (dolist (file (gptel-otel--entry-files))
+      (let* ((meta (gptel-otel--read-meta file))
+             (state (plist-get meta :state))
+             (group (plist-get meta :export-group-id)))
+        (when (memq state states)
+          (when group (cl-pushnew group groups :test #'equal))
+          (ignore-errors (delete-file file))
+          (ignore-errors (delete-file (gptel-otel--metadata-file file)))
+          (cl-incf count))))
+    (dolist (group groups)
+      (when (null (gptel-otel--group-member-files group))
+        (ignore-errors (delete-file (gptel-otel--group-marker-file group)))))
+    (when (called-interactively-p 'interactive)
+      (message "Deleted %d gptel-otel queue entr%s"
+               count (if (= count 1) "y" "ies")))
+    count))
+
 (provide 'gptel-otel-transport)
 ;;; gptel-otel-transport.el ends here

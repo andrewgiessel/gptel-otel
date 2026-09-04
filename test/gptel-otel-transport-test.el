@@ -409,4 +409,18 @@
                     (plist-get destination :destination-id)))
        (should (file-exists-p file))))))
 
+(ert-deftest gptel-otel-purge-queue-removes-only-selected-terminal-states ()
+  (gptel-otel-test--with-spool
+   (gptel-otel--ensure-spool)
+   (let ((mismatch (expand-file-name "mismatch.json" dir))
+         (pending (expand-file-name "pending.json" dir)))
+     (dolist (file (list mismatch pending))
+       (gptel-otel--write-private file "{}" t))
+     (gptel-otel--write-meta mismatch '(:state mismatched :attempts 0))
+     (gptel-otel--write-meta pending '(:state pending :attempts 0))
+     (should (= 1 (gptel-otel-purge-queue '(mismatched))))
+     (should-not (file-exists-p mismatch))
+     (should (file-exists-p pending))
+     (should-error (gptel-otel-purge-queue '(pending))))))
+
 (provide 'gptel-otel-transport-test)
