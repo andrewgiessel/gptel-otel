@@ -60,6 +60,31 @@ This separates gptel lifecycle capture from backend and semantic conventions."
 (defun gptel-otel--serialize (object)
   (condition-case nil (json-encode object) (error (prin1-to-string object t))))
 
+(defun gptel-otel--role-name (value)
+  "Return VALUE as a normalized lowercase role name."
+  (and value (downcase (format "%s" value))))
+
+(defun gptel-otel--latest-user-input (data)
+  "Return the latest user message from provider request DATA.
+Fall back to DATA only when no provider message collection can be identified."
+  (let* ((messages (or (plist-get data :messages)
+                       (plist-get data :input)
+                       (plist-get data :contents)))
+         (items (cond ((vectorp messages) (append messages nil))
+                      ((listp messages) messages)))
+         found)
+    (dolist (message items)
+      (when (and (listp message)
+                 (member (gptel-otel--role-name
+                          (or (plist-get message :role)
+                              (plist-get message :author)))
+                         '("user" "human")))
+        (setq found (or (plist-get message :content)
+                        (plist-get message :parts)
+                        (plist-get message :text)
+                        message))))
+    (or found (and (null messages) data))))
+
 (defun gptel-otel--string-attr (key value)
   (and value (cons key (gptel-otel-value-string value))))
 
@@ -192,7 +217,7 @@ This separates gptel lifecycle capture from backend and semantic conventions."
   (let* ((metadata (condition-case nil
                        (funcall gptel-otel-trace-metadata-function fsm)
                      (error nil)))
-         (root-name (or (plist-get metadata :name) "gptel.chat"))
+         (root-name (or (plist-get metadata :name) "chat-turn"))
          (trace (if parent-context (gptel-otel--context-trace parent-context)
                   (gptel-otel-trace-create
                    root-name (gptel-otel--semantic-attributes
@@ -259,8 +284,10 @@ This separates gptel lifecycle capture from backend and semantic conventions."
              (parent (or agent (gptel-otel--context-root context)))
              (input (plist-get info :data))
              (attrs (gptel-otel--observation-attributes context "generation" input nil))
+             (model (format "%s" (or (plist-get info :model) "unknown")))
              (span (gptel-otel-trace-start-span
-                    (gptel-otel--context-trace context) "gptel.generation" parent attrs))
+                    (gptel-otel--context-trace context)
+                    (format "chat %s" model) parent attrs))
              (callback (plist-get info :callback)))
         (setf (gptel-otel--context-current-generation context) span
               (gptel-otel--context-generations context)
@@ -313,9 +340,10 @@ This separates gptel lifecycle capture from backend and semantic conventions."
                       (gethash call (gptel-otel--context-tool-spans context)))
             (let ((span (gptel-otel-trace-start-span
                          (gptel-otel--context-trace context)
-                         (format "tool.%s" (plist-get call :name))
-                         (or (car (last (gptel-otel--context-generations context)))
-                             (gptel-otel--context-root context))
+                         (format "execute_tool %s" (plist-get call :name))
+                         ;; The model call that requested a tool has ended.
+                         ;; Execution is a sibling under the owning agent/turn.
+                         (gptel-otel--context-root context)
                          (append (gptel-otel--observation-attributes
                                   context "tool" (plist-get call :args) nil call)
                                  (and (plist-get call :id)
@@ -439,7 +467,11 @@ awaiting confirmation."
          (span (and parent-context tool-span
                     (gptel-otel-trace-start-span
                      (gptel-otel--context-trace parent-context)
-                     (format "agent.%s" agent-type) tool-span
+                     (format "invoke_agent %s" agent-type)
+                     ;; Keep the concrete Agent tool dispatch as the causal
+                     ;; parent of the invoked subagent.  This preserves exact
+                     ;; concurrent-call attribution and terminal accounting.
+                     tool-span
                      (append
                       (gptel-otel--observation-attributes
                        parent-context "agent"
@@ -491,7 +523,8 @@ awaiting confirmation."
       ;; Child contexts share an agent span as root; its callback owns that span.
       (when (eq root (gptel-otel-trace-root (gptel-otel--context-trace context)))
         (gptel-otel--set-semantic-attributes
-         root :kind 'root-finish :type "span" :input (plist-get info :data)
+         root :kind 'root-finish :type "span"
+         :input (gptel-otel--latest-user-input (plist-get info :data))
          :output (gptel-otel--response-text info) :info info)
         (gptel-otel-end-span root (if (eq terminal 'DONE) (gptel-otel-status-ok)
                                    (gptel-otel-status-error (or (plist-get info :status)
