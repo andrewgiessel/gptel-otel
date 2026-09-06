@@ -10,10 +10,11 @@ BATCH = $(EMACS) -Q --batch $(PACKAGE_INIT) -L . $(DEPS)
 .PHONY: test compile clean
 
 test:
-	$(BATCH) -L test -l test/gptel-otel-core-test.el -l test/gptel-otel-transport-test.el -l test/gptel-otel-test.el -f ert-run-tests-batch-and-exit
+	$(BATCH) -L test -l test/gptel-otel-core-test.el -l test/gptel-otel-transport-test.el -l test/gptel-otel-test.el -l test/gptel-otel-langfuse-mcp-test.el -f ert-run-tests-batch-and-exit
 
 compile:
 	$(BATCH) -f batch-byte-compile gptel-otel-core.el gptel-otel-transport.el gptel-otel.el
+	$(BATCH) -f batch-byte-compile gptel-otel-langfuse-mcp.el
 
 lint:
 	$(BATCH) -l package-lint -f package-lint-batch-and-exit gptel-otel.el
