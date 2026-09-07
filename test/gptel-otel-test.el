@@ -42,11 +42,17 @@
   (should-not (advice-member-p #'gptel-otel--around-transition
                                'gptel--fsm-transition)))
 
-(ert-deftest gptel-otel-signature-guard-degrades-one-layer ()
+(ert-deftest gptel-otel-signature-guard-disables-required-capability-coherently ()
   (let ((gptel-otel--installed-advices nil)
-        (gptel-otel--guarded-seams
-         '((gptel--handle-wait (wrong) gptel-otel--before-wait :before generation))))
-    (gptel-otel--setup-advice)
+        (gptel-otel--base-seams
+         '((root
+            (gptel-send (&optional arg) gptel-otel--around-send :around))
+           (generation
+            (gptel--handle-wait (wrong) gptel-otel--before-wait :before)
+            (gptel--fsm-transition (machine &optional new-state)
+                                   gptel-otel--around-transition :around))
+           (tool))))
+    (gptel-otel--base-adapter-install)
     (should-not gptel-otel--installed-advices)))
 
 (ert-deftest gptel-otel-generation-loop-and-per-generation-usage ()
@@ -257,6 +263,7 @@
        (should (> (gptel-otel-trace-outstanding trace) 0))))))
 
 (ert-deftest gptel-otel-subagent-joins-trace-and-nests-under-tool ()
+  (unless (featurep 'gptel-agent) (ert-skip "gptel-agent is optional"))
   (gptel-otel-test--isolated
    (let* ((call (list :id "agent-1" :name "Agent" :args nil))
           (parent (gptel-otel-test--fsm
@@ -317,6 +324,7 @@
          (should (gptel-otel-trace-spans trace)))))))
 
 (ert-deftest gptel-otel-root-waits-for-late-agent-callback-and-cleans-up ()
+  (unless (featurep 'gptel-agent) (ert-skip "gptel-agent is optional"))
   (gptel-otel-test--isolated
    (let* ((call (list :id "agent" :name "Agent" :args nil))
           (parent (gptel-otel-test--fsm
@@ -351,6 +359,7 @@
          (should (= 0 (hash-table-count gptel-otel--span-data))))))))
 
 (ert-deftest gptel-otel-concurrent-agent-calls-use-exact-tool-spans ()
+  (unless (featurep 'gptel-agent) (ert-skip "gptel-agent is optional"))
   (gptel-otel-test--isolated
    (let* ((call-a (list :id "a" :name "Agent" :args (list :prompt "a")))
           (call-b (list :id "b" :name "Agent" :args (list :prompt "b")))
@@ -380,6 +389,7 @@
                        (gptel-otel--context-root (gptel-otel--context child-b)))))))))
 
 (ert-deftest gptel-otel-nested-agent-lineage-is-exact ()
+  (unless (featurep 'gptel-agent) (ert-skip "gptel-agent is optional"))
   (gptel-otel-test--isolated
    (let* ((outer-call (list :id "outer" :name "Agent" :args nil))
           (parent (gptel-otel-test--fsm
@@ -427,6 +437,20 @@
      (cl-letf (((symbol-function 'gptel-otel-trace-start-span)
                 (lambda (&rest _) (error "telemetry"))))
        (should-not (gptel-otel--before-wait fsm))))))
+
+(ert-deftest gptel-otel-transition-contains-pre-orig-telemetry-failure-once ()
+  (let ((fsm (gptel-otel-test--fsm)) (calls 0))
+    (cl-letf (((symbol-function 'gptel-fsm-state) (lambda (&rest _) (error "telemetry"))))
+      (should (eq 'ok (gptel-otel--around-transition
+                       (lambda (&rest _) (setq calls (1+ calls)) 'ok) fsm nil)))
+      (should (= 1 calls)))))
+
+(ert-deftest gptel-otel-process-tool-contains-post-orig-telemetry-failure-once ()
+  (let ((fsm (gptel-otel-test--fsm)) (calls 0))
+    (cl-letf (((symbol-function 'gptel-otel--finish-tool) (lambda (&rest _) (error "telemetry"))))
+      (should (eq 'ok (gptel-otel--around-process-tool
+                       (lambda (&rest _) (setq calls (1+ calls)) 'ok) fsm nil nil nil)))
+      (should (= 1 calls)))))
 
 (ert-deftest gptel-otel-agent-correlation-does-not-mutate-tool-arguments ()
   (gptel-otel-test--isolated
@@ -484,6 +508,7 @@
                       (gptel-otel-span-parent-span-id tool)))))))
 
 (ert-deftest gptel-otel-stock-agent-tool-integration ()
+  (unless (featurep 'gptel-agent) (ert-skip "gptel-agent is optional"))
   (let ((agent-tool (gptel-get-tool '("gptel-agent" "Agent"))))
     (should agent-tool)
     (should (eq (gptel-tool-function agent-tool) #'gptel-agent--task))

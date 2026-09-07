@@ -1,18 +1,16 @@
 # gptel-otel
 
-OpenTelemetry tracing for [gptel](https://github.com/karthink/gptel) and [gptel-agent](https://github.com/karthink/gptel-agent).
+OpenTelemetry tracing for stock [gptel](https://github.com/karthink/gptel), with optional [gptel-agent](https://github.com/karthink/gptel-agent) support. No personal configuration or patched gptel is required.
 
 `gptel-otel` records one trace per gptel request, with nested observations for model generations, tool executions, and delegated agents. Traces are durably spooled before asynchronous OTLP/HTTP JSON delivery. Langfuse is the first polished backend; generic OTLP/HTTP collectors are supported through backend profiles.
 
 ## Status
 
-This package is pre-1.0 and depends on signature-guarded private gptel and gptel-agent lifecycle functions. It currently targets:
+This package is pre-1.0. It requires Emacs 29.1+ and gptel 0.9.9+; that minimum version is not a guarantee of compatibility with every upstream revision. The tested baseline is gptel `fc6963634af2` (package `20260805.313`) and, optionally, gptel-agent `e833bcaf617b` (package `20260717.506`). CI is configured to test both pinned baseline and current MELPA dependencies, with and without gptel-agent.
 
-- Emacs 29.1 or later
-- gptel 0.9.9 or later
-- gptel-agent `0.0.1` from a current development snapshot (tested with `20260824.106`)
+Exact lifecycle tracing still uses private upstream functions through compatibility adapters. Signature mismatches disable dependent capabilities together: required request/generation tracing, optional tool tracing, and optional agent correlation. Signature checks cannot detect every upstream behavior change; lifecycle contract tests provide additional coverage. Recheck compatibility when upgrading.
 
-If a private function signature changes, the affected instrumentation layer is disabled with a warning instead of changing gptel control flow. Compatibility still needs to be verified when upgrading gptel or gptel-agent.
+`M-x gptel-otel-compatibility-status` reports compatible versus active capabilities and the first mismatched function, if any. Missing optional gptel-agent is normal, not an error.
 
 ## Trace model
 
@@ -33,14 +31,22 @@ The default metadata provider does not assign a session ID. Applications with du
 
 ## Installation
 
-Clone the repository and add it to `load-path`, or install it with a package manager that supports Git repositories. Ensure gptel-agent is installed first.
+Install gptel, then clone this repository and add it to `load-path`, or use a package manager that supports Git repositories. gptel-agent is not required.
 
 ```elisp
 (add-to-list 'load-path "/path/to/gptel-otel")
 (require 'gptel-otel)
 ```
 
-Load the package after gptel-agent, configure a backend, and then enable the global mode.
+Configure a backend, then enable the global mode.
+
+### Optional subagent tracing
+
+Stock gptel provides model requests and tool execution. gptel-agent adds tools, agent presets, and an asynchronous `Agent` tool that starts another gptel request and returns its result to the parent.
+
+There is one shared request-tracing path. When gptel-agent is loaded, the optional adapter adds the parent–child association between an `Agent` invocation and its child request; it does not replace or duplicate base tracing. Compatible agent support activates automatically, including when gptel-agent loads after `gptel-otel-mode` is enabled. gptel-otel never loads gptel-agent for you.
+
+Custom tools can also launch child gptel requests without gptel-agent. Those requests are traced, but exact subagent parentage requires an integration for that implementation.
 
 ## Langfuse
 
@@ -138,19 +144,16 @@ A trace may be split across several byte-bounded OTLP requests. Batch boundaries
 
 ## Development
 
-Run tests against package directories already installed on the machine:
+Run tests in fresh `emacs -Q --batch` processes. The base run excludes gptel-agent from the load path; the agent run uses an installed package directory containing gptel, gptel-agent, and its dependencies:
 
 ```sh
-make test \
-  GPTEL_DIR=/path/to/gptel \
-  GPTEL_AGENT_DIR=/path/to/gptel-agent
+make test-base GPTEL_DIR=/path/to/gptel
+make test-agent ELPA_DIR=/path/to/elpa
 
-make compile \
-  GPTEL_DIR=/path/to/gptel \
-  GPTEL_AGENT_DIR=/path/to/gptel-agent
+make compile GPTEL_DIR=/path/to/gptel
 ```
 
-The test suite includes stock gptel request, generation, tool, and gptel-agent lifecycle fixtures; durable queue recovery; destination isolation; batching; partial-success handling; and failure containment.
+`make test` defaults to the base configuration; `WITH_AGENT=1` selects agent support. Tests use temporary queues and simulated delivery. The suite includes real stock-gptel request/FSM execution with simulated transport (streaming, synchronous/asynchronous tools, concurrent requests, errors, and aborts), synthetic agent-lineage fixtures, late agent loading, compatibility guards, and durable transport tests. It does not make live model or collector requests.
 
 ## License
 

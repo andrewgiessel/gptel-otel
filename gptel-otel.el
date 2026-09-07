@@ -4,15 +4,15 @@
 ;; Author: Andrew Giessel <andrew.giessel@gmail.com>
 ;; Maintainer: Andrew Giessel <andrew.giessel@gmail.com>
 ;; Version: 0.3.0
-;; Package-Requires: ((emacs "29.1") (gptel "0.9.9") (gptel-agent "0.0.1"))
+;; Package-Requires: ((emacs "29.1") (gptel "0.9.9"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/andrewgiessel/gptel-otel
 
 ;;; Commentary:
-;; OpenTelemetry tracing for stock gptel and gptel-agent.  The global minor
-;; mode records one trace per gptel request, with nested model-generation,
-;; tool-execution, and subagent observations.  Completed spans are durably
-;; spooled and exported via OTLP/HTTP JSON.  Langfuse is the polished default
+;; OpenTelemetry tracing for stock gptel, with optional gptel-agent support.
+;; The global minor mode records one trace per gptel request, with nested
+;; model-generation, tool-execution, and subagent observations when available.
+;; Completed spans are durably spooled and exported via OTLP/HTTP JSON.  Langfuse is the polished default
 ;; backend profile; generic OTLP/HTTP collectors are also supported.
 ;;
 ;; gptel currently lacks public lifecycle hooks with all required correlation
@@ -27,7 +27,6 @@
 (require 'json)
 (require 'subr-x)
 (require 'gptel)
-(require 'gptel-agent)
 (require 'gptel-otel-core)
 (require 'gptel-otel-transport)
 
@@ -53,12 +52,12 @@ This separates gptel lifecycle capture from backend and semantic conventions."
   trace root current-generation generations tool-spans metadata terminal-p)
 
 (defvar gptel-otel--contexts (make-hash-table :test #'eq))
-(defvar gptel-otel--parent-fsm nil)
-(defvar gptel-otel--pending-agent nil)
-(defvar gptel-otel--agent-bindings (make-hash-table :test #'eq))
-(defvar gptel-otel--next-agent-execution nil)
 (defvar gptel-otel--user-turn nil)
-(defvar gptel-otel--installed-advices nil)
+(defvar gptel-otel--pending-agent nil)
+(defvar gptel-otel--parent-fsm nil)
+(defvar gptel-otel--agent-bindings)
+(defvar gptel-otel-mode nil)
+;; Adapter modules own private upstream compatibility checks and advice state.
 
 (defun gptel-otel-default-trace-metadata (_fsm)
   "Return default generic trace metadata."
@@ -266,9 +265,6 @@ Fall back to DATA only when no provider message collection can be identified."
     (error (display-warning 'gptel-otel (format "Root instrumentation failed: %s" err) :warning)))
   nil)
 
-(defun gptel-otel--around-send (orig &rest args)
-  (let ((gptel-otel--user-turn t)) (apply orig args)))
-
 (defun gptel-otel--generation-callback (span original response info &rest raw)
   "Call ORIGINAL in order, then capture RESPONSE for generation SPAN."
   ;; Preserve the caller's arity exactly: gptel invokes callbacks with either
@@ -356,194 +352,6 @@ Fall back to DATA only when no provider message collection can be identified."
     (setf (gptel-otel--context-current-generation context) nil)
     (gptel-otel--maybe-export (gptel-otel--context-trace context))))
 
-(defun gptel-otel--around-transition (orig machine &optional new-state)
-  (let ((old-state (gptel-fsm-state machine)) result)
-    (condition-case err
-        (setq result (funcall orig machine new-state))
-      (error
-       (condition-case nil
-           (progn (when (eq old-state 'TYPE) (gptel-otel--finish-generation machine))
-                  (gptel-otel--finalize machine 'error))
-         (error nil))
-       (signal (car err) (cdr err))))
-    (condition-case telemetry-error
-        (progn
-          (when (eq old-state 'TYPE) (gptel-otel--finish-generation machine))
-          (when (memq (gptel-fsm-state machine) '(DONE ERRS ABRT))
-            (gptel-otel--finalize machine (gptel-fsm-state machine))))
-      (error (display-warning 'gptel-otel
-                              (format "Transition telemetry failed: %s" telemetry-error) :warning)))
-    result))
-
-(defun gptel-otel--before-pre-tool (fsm)
-  (condition-case err
-      (when-let* ((context (gptel-otel--context fsm)))
-        (dolist (call (plist-get (gptel-fsm-info fsm) :tool-use))
-          (unless (or (plist-get call :result)
-                      (gethash call (gptel-otel--context-tool-spans context)))
-            (let ((span (gptel-otel-trace-start-span
-                         (gptel-otel--context-trace context)
-                         (format "execute_tool %s" (plist-get call :name))
-                         ;; The model call that requested a tool has ended.
-                         ;; Execution is a sibling under the owning agent/turn.
-                         (gptel-otel--context-root context)
-                         (append (gptel-otel--observation-attributes
-                                  context "tool" (plist-get call :args) nil call)
-                                 (and (plist-get call :id)
-                                      `(("tool.call.id" .
-                                         ,(gptel-otel-value-string (plist-get call :id)))))))))
-              (puthash call span (gptel-otel--context-tool-spans context))
-              (when (equal (plist-get call :name) "Agent")
-                ;; The exact argument plist is passed unchanged to
-                ;; `gptel--map-tool-args'.  Keying by its identity preserves
-                ;; exact concurrent-call attribution without injecting private
-                ;; values into provider/tool data.
-                (puthash (plist-get call :args) (list fsm call span)
-                         gptel-otel--agent-bindings))))))
-    (error (display-warning 'gptel-otel (format "Tool start failed: %s" err) :warning))))
-
-(defun gptel-otel--around-process-tool (orig fsm tool-spec tool-call result)
-  (let (value)
-    (condition-case err
-        (setq value (funcall orig fsm tool-spec tool-call result))
-      (error
-       (gptel-otel--finish-tool fsm tool-call result err)
-       (signal (car err) (cdr err))))
-    (gptel-otel--finish-tool fsm tool-call result nil)
-    value))
-
-(defun gptel-otel--finish-tool (fsm tool-call result error)
-  (condition-case telemetry-error
-      (when-let* ((context (gptel-otel--context fsm))
-                  (span (gethash tool-call (gptel-otel--context-tool-spans context))))
-        (gptel-otel--set-semantic-attributes
-         span :kind 'observation-finish :type "tool" :output result :tool-call tool-call)
-        ;; String results are intentionally not inferred to be exceptions.
-        (gptel-otel-trace-end-span
-         (gptel-otel--context-trace context) span
-         (if (or error (plist-get tool-call :error))
-             (gptel-otel-status-error (and error (error-message-string error)))
-           (gptel-otel-status-ok)))
-        (gptel-otel--maybe-export (gptel-otel--context-trace context)))
-    (error (display-warning 'gptel-otel (format "Tool finish failed: %s" telemetry-error) :warning))))
-
-(defun gptel-otel--reconcile-tool-spans (fsm &optional terminal)
-  "Finish tool spans for FSM that bypassed the normal result seam.
-A call that disappeared from `:tool-use' was consumed internally by gptel
-\(currently its structured-output ersatz tool).  At TERMINAL, any remaining
-open call is conservatively recorded as abandoned.  Nonterminal calls still
-present without results are left open because they may be asynchronous or
-awaiting confirmation."
-  (when-let* ((context (gptel-otel--context fsm)))
-    (let ((calls (plist-get (gptel-fsm-info fsm) :tool-use))
-          pending)
-      (maphash
-       (lambda (call span)
-         (unless (gptel-otel-span-ended-p span)
-           (cond
-            ((plist-member call :result)
-             (push (list call (plist-get call :result)
-                         (and (plist-get call :error)
-                              '(error "Tool call marked as failed")))
-                   pending))
-            ((not (memq call calls))
-             ;; gptel's structured-output pseudo-tool is consumed without
-             ;; `gptel--process-tool-call'; its arguments are the output.
-             (push (list call (plist-get call :args) nil) pending))
-            ((and terminal
-                  ;; An Agent tool can still be legitimately running after the
-                  ;; root request reaches a terminal UI state.  Its child span
-                  ;; proves that the tool has not been abandoned yet.
-                  (not (cl-some
-                        (lambda (child)
-                          (and (not (gptel-otel-span-ended-p child))
-                               (equal (gptel-otel-span-parent-span-id child)
-                                      (gptel-otel-span-span-id span))))
-                        (gptel-otel-trace-spans
-                         (gptel-otel--context-trace context)))))
-             (push (list call nil '(error "Tool call abandoned")) pending)))))
-       (gptel-otel--context-tool-spans context))
-      (dolist (entry pending)
-        (gptel-otel--finish-tool fsm (nth 0 entry) (nth 1 entry) (nth 2 entry))))))
-
-(defun gptel-otel--around-tool-use (orig fsm)
-  "Call ORIG for FSM while retaining exact parent and tool lifecycles."
-  (let ((gptel-otel--parent-fsm fsm)
-        result)
-    (unwind-protect
-        (setq result (funcall orig fsm))
-      ;; Reconcile calls such as gptel's structured-output pseudo-tool that
-      ;; are consumed without reaching `gptel--process-tool-call'.
-      (condition-case err
-          (gptel-otel--reconcile-tool-spans fsm)
-        (error (display-warning 'gptel-otel
-                                (format "Tool reconciliation failed: %s" err)
-                                :warning))))
-    result))
-
-(defun gptel-otel--around-map-tool-args (orig tool-spec args)
-  "Call ORIG with TOOL-SPEC and ARGS, binding the exact Agent call."
-  (prog1 (funcall orig tool-spec args)
-    (when (equal (gptel-tool-name tool-spec) "Agent")
-      (setq gptel-otel--next-agent-execution
-            (gethash args gptel-otel--agent-bindings)))))
-
-(defun gptel-otel--agent-callback (span context original value)
-  (prog1 (funcall original value)
-    (condition-case err
-        (progn
-          (gptel-otel--set-semantic-attributes
-           span :kind 'observation-finish :type "agent" :output value)
-          (gptel-otel-trace-end-span
-           (gptel-otel--context-trace context) span
-           (if (and (stringp value) (string-prefix-p "Error:" value))
-               (gptel-otel-status-error value)
-             (gptel-otel-status-ok)))
-          (gptel-otel--maybe-export (gptel-otel--context-trace context)))
-      (error (display-warning 'gptel-otel (format "Agent finish failed: %s" err) :warning)))))
-
-(defun gptel-otel--around-agent-task (orig main-cb agent-type description prompt)
-  (let* ((execution (prog1 gptel-otel--next-agent-execution
-                      (setq gptel-otel--next-agent-execution nil)))
-         (parent-fsm (or (car-safe execution) gptel-otel--parent-fsm))
-         (parent-context (and parent-fsm (gptel-otel--context parent-fsm)))
-         (tool-span (nth 2 execution))
-         (span (and parent-context tool-span
-                    (gptel-otel-trace-start-span
-                     (gptel-otel--context-trace parent-context)
-                     (format "invoke_agent %s" agent-type)
-                     ;; Keep the concrete Agent tool dispatch as the causal
-                     ;; parent of the invoked subagent.  This preserves exact
-                     ;; concurrent-call attribution and terminal accounting.
-                     tool-span
-                     (append
-                      (gptel-otel--observation-attributes
-                       parent-context "agent"
-                       (list :type agent-type :description description :prompt prompt) nil)
-                      (delq nil
-                            (list
-                             (gptel-otel--string-attr
-                              "langfuse.observation.metadata.subagent_type"
-                              agent-type)
-                             (gptel-otel--string-attr
-                              "langfuse.observation.metadata.description"
-                              description)))))))
-         (wrapped (if span (apply-partially #'gptel-otel--agent-callback
-                                            span parent-context main-cb)
-                    main-cb))
-         (gptel-otel--pending-agent span)
-         child)
-    (condition-case err
-        (setq child (funcall orig wrapped agent-type description prompt))
-      (error (when span
-               (gptel-otel-trace-end-span
-                (gptel-otel--context-trace parent-context) span
-                (gptel-otel-status-error (error-message-string err)))
-               (gptel-otel--maybe-export (gptel-otel--context-trace parent-context)))
-             (signal (car err) (cdr err))))
-    (when (and span child (not (gptel-otel--context child)))
-      (gptel-otel--new-context child parent-context span))
-    child))
 
 (defun gptel-otel--response-text (info)
   (let ((start (plist-get info :position))
@@ -668,49 +476,77 @@ are left unchanged.  Return the number of terminal contexts examined."
                count (if (= count 1) "" "s")))
     count))
 
-(defconst gptel-otel--guarded-seams
-  '((gptel-send (&optional arg) gptel-otel--around-send :around root)
-    (gptel--handle-wait (fsm) gptel-otel--before-wait :before generation)
-    (gptel--fsm-transition (machine &optional new-state) gptel-otel--around-transition :around generation)
-    (gptel--handle-pre-tool (fsm) gptel-otel--before-pre-tool :before tool)
-    (gptel--process-tool-call (fsm tool-spec tool-call result) gptel-otel--around-process-tool :around tool)
-    (gptel--handle-tool-use (fsm) gptel-otel--around-tool-use :around tool)
-    (gptel--map-tool-args (tool-spec args) gptel-otel--around-map-tool-args :around tool)
-    (gptel-agent--task (main-cb agent-type description prompt) gptel-otel--around-agent-task :around agent)))
+(require 'gptel-otel-adapter)
+(require 'gptel-otel-agent-adapter)
 
-(defun gptel-otel--signature-equal-p (symbol expected)
-  (and (fboundp symbol) (equal (help-function-arglist symbol t) expected)))
+(defun gptel-otel--mode-reconcile-prompt (base)
+  "Reconcile request-root hook with active required base lifecycle BASE."
+  (remove-hook 'gptel-prompt-transform-functions #'gptel-otel--instrument-request)
+  (when (and gptel-otel-mode (plist-get base 'base))
+    (add-hook 'gptel-prompt-transform-functions #'gptel-otel--instrument-request t)))
 
-(defun gptel-otel--setup-advice ()
-  (dolist (seam gptel-otel--guarded-seams)
-    (pcase-let ((`(,symbol ,args ,advice ,where ,layer) seam))
-      (if (gptel-otel--signature-equal-p symbol args)
-          (unless (advice-member-p advice symbol)
-            (advice-add symbol where advice)
-            (push (cons symbol advice) gptel-otel--installed-advices))
-        (display-warning 'gptel-otel
-                         (format "%s instrumentation disabled: %s signature is %S, expected %S"
-                                 layer symbol (and (fboundp symbol)
-                                                   (help-function-arglist symbol t)) args)
-                         :warning)))))
-
-(defun gptel-otel--teardown-advice ()
-  (dolist (pair gptel-otel--installed-advices)
-    (advice-remove (car pair) (cdr pair)))
-  (setq gptel-otel--installed-advices nil))
+;;;###autoload
+(defun gptel-otel-compatibility-status ()
+  "Display and return bounded private-upstream compatibility diagnostics.
+The returned plist reports whether required base tracing, optional tool
+tracing, and optional gptel-agent correlation can be installed coherently."
+  (interactive)
+  (let* ((base (gptel-otel--base-adapter-capabilities))
+         (agent (gptel-otel--agent-adapter-status base))
+         (base-compatible (plist-get base 'base))
+         (tool-compatible (and base-compatible (plist-get (plist-get base 'tool) :supported)))
+         (base-active (and gptel-otel-mode base-compatible
+                           (gptel-otel--base-adapter-active-p)
+                           (memq #'gptel-otel--instrument-request
+                                 (default-value 'gptel-prompt-transform-functions)) t))
+         (tool-active (and base-active tool-compatible
+                           (gptel-otel--base-adapter-active-p t)))
+         (agent-active (and tool-active (plist-get agent :supported)
+                            (gptel-otel--seams-active-p gptel-otel--agent-seams)))
+         (failure (or (cl-find-if-not (lambda (s) (plist-get s :supported))
+                                      (plist-get (plist-get base 'root) :seams))
+                      (cl-find-if-not (lambda (s) (plist-get s :supported))
+                                      (plist-get (plist-get base 'generation) :seams))
+                      (cl-find-if-not (lambda (s) (plist-get s :supported))
+                                      (plist-get (plist-get base 'tool) :seams))
+                      (and (plist-get agent :available)
+                           (cl-find-if-not (lambda (s) (plist-get s :supported))
+                                           (plist-get agent :seams)))))
+         (status (list :mode gptel-otel-mode
+                       :runtime-emacs emacs-version :runtime-gptel (and (boundp 'gptel-version) gptel-version)
+                       :base-compatible base-compatible :base-active base-active
+                       :tool-compatible tool-compatible :tool-active tool-active
+                       :agent-available (plist-get agent :available)
+                       :agent-compatible (plist-get agent :supported) :agent-active agent-active
+                       :agent-reason (unless (plist-get agent :available) "optional gptel-agent not loaded")
+                       :failed-symbol (plist-get failure :symbol)
+                       :failed-expected (plist-get failure :expected)
+                       :failed-actual (plist-get failure :actual)
+                       ;; Compatibility aliases retained for callers of the
+                       ;; initial diagnostics API; these mean compatibility.
+                       :base base-compatible :tool tool-compatible
+                       :agent (plist-get agent :supported))))
+      (when (called-interactively-p 'interactive)
+        (message "gptel-otel: base=%s tool=%s agent=%s%s"
+                 base-active tool-active
+                 (if (plist-get status :agent-available)
+                     agent-active "unavailable")
+                 (if (plist-get status :agent-available) "" " (optional gptel-agent not loaded)")))
+      status))
 
 ;;;###autoload
 (define-minor-mode gptel-otel-mode
   "Globally instrument gptel while containing all telemetry failures."
   :global t :group 'gptel-otel
   (if gptel-otel-mode
-      (progn
-        (add-hook 'gptel-prompt-transform-functions #'gptel-otel--instrument-request t)
-        (gptel-otel--setup-advice)
+      (let ((base (gptel-otel--base-adapter-install)))
+        (gptel-otel--mode-reconcile-prompt base)
+        (gptel-otel--agent-adapter-install base)
         (gptel-otel-cleanup-stale-contexts)
         (gptel-otel-replay))
     (remove-hook 'gptel-prompt-transform-functions #'gptel-otel--instrument-request)
-    (gptel-otel--teardown-advice)))
+    (gptel-otel--agent-adapter-uninstall)
+    (gptel-otel--base-adapter-uninstall)))
 
 (provide 'gptel-otel)
 ;;; gptel-otel.el ends here

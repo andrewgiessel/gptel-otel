@@ -21,6 +21,11 @@ jobs:
         emacs_version:
           - "29.1"
           - "30.1"
+        dependencies: [pinned, current]
+        agent: ["0", "1"]
+
+    env:
+      WITH_AGENT: ${{ matrix.agent }}
 
     steps:
       - uses: actions/checkout@v5
@@ -28,6 +33,22 @@ jobs:
       - uses: purcell/setup-emacs@v5.0
         with:
           version: ${{ matrix.emacs_version }}
+
+      # Baseline revisions match the stock installations used by the
+      # lifecycle contract tests.  Current jobs independently detect drift.
+      - uses: actions/checkout@v5
+        if: matrix.dependencies == 'pinned'
+        with:
+          repository: karthink/gptel
+          ref: fc6963634af2f76a9909ad674e2c0b3f005e60b5
+          path: .ci-gptel
+
+      - uses: actions/checkout@v5
+        if: matrix.dependencies == 'pinned' && matrix.agent == '1'
+        with:
+          repository: karthink/gptel-agent
+          ref: e833bcaf617baf8c8075eac098231c4457386814
+          path: .ci-gptel-agent
 
       - name: Install dependencies
         run: |
@@ -37,21 +58,23 @@ jobs:
             --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
             --eval "(package-initialize)" \
             --eval "(package-refresh-contents)" \
-            --eval "(package-install 'gptel)" \
-            --eval "(package-install 'gptel-agent)" \
-            --eval "(package-install 'package-lint)"
+            --eval "(package-install 'package-lint)" \
+            --eval "(when (equal \"${{ matrix.dependencies }}\" \"current\") (package-install 'gptel))" \
+            --eval "(when (equal (getenv \"WITH_AGENT\") \"1\") (if (equal \"${{ matrix.dependencies }}\" \"current\") (package-install 'gptel-agent) (mapc #'package-install '(compat yaml orderless))))"
 
       - name: Test and compile
         run: |
-          make clean test compile ELPA_DIR=.ci-elpa
+          make test compile ELPA_DIR=.ci-elpa GPTEL_DIR=.ci-gptel GPTEL_AGENT_DIR=.ci-gptel-agent
+          # Repeat against compiled package code, not just source.
+          make test ELPA_DIR=.ci-elpa GPTEL_DIR=.ci-gptel GPTEL_AGENT_DIR=.ci-gptel-agent
 
       - name: Check documentation
         run: |
           emacs -Q --batch \
             --eval "(progn (require 'package) (setq package-user-dir (expand-file-name \".ci-elpa\")) (package-initialize))" \
-            -L . \
-            --eval "(progn (require 'checkdoc) (let ((checkdoc-force-docstrings-flag nil)) (checkdoc-file \"gptel-otel-core.el\") (checkdoc-file \"gptel-otel-transport.el\") (checkdoc-file \"gptel-otel.el\")))"
+            -L . -L .ci-gptel -L .ci-gptel-agent \
+            --eval "(progn (require 'checkdoc) (let ((checkdoc-force-docstrings-flag nil)) (checkdoc-file \"gptel-otel-core.el\") (checkdoc-file \"gptel-otel-transport.el\") (checkdoc-file \"gptel-otel.el\") (checkdoc-file \"gptel-otel-adapter.el\") (checkdoc-file \"gptel-otel-agent-adapter.el\") (checkdoc-file \"gptel-otel-langfuse-mcp.el\")))"
 
       - name: Package lint
         run: |
-          make lint ELPA_DIR=.ci-elpa
+          make lint ELPA_DIR=.ci-elpa GPTEL_DIR=.ci-gptel GPTEL_AGENT_DIR=.ci-gptel-agent
