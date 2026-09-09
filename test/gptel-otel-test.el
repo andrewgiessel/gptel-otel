@@ -11,6 +11,7 @@
           (gptel-otel--watchdog-timer nil)
           (gptel-otel-delivery-function (lambda (_payload _callback) nil))
           (gptel-otel--contexts (make-hash-table :test #'eq))
+          (gptel-otel--request-decisions (make-hash-table :test #'eq :weakness 'key))
           (gptel-otel-capture-payloads t)
           (gptel-otel-backend-profile 'langfuse)
           (gptel-otel--span-data (make-hash-table :test #'eq))
@@ -307,6 +308,28 @@
          (gptel-otel--finalize fsm 'ABRT)
          (should (= 1 count))
          (should (equal 2 (cdr (assq 'code (gptel-otel-span-status root))))))))))
+
+(ert-deftest gptel-otel-inhibited-parent-suppresses-agent-child ()
+  (unless (featurep 'gptel-agent) (ert-skip "gptel-agent is optional"))
+  (gptel-otel-test--isolated
+   (let* ((call (list :id "agent" :name "Agent" :args (list :prompt "child")))
+          (parent (gptel-otel-test--fsm
+                   (list :data nil :model 'm :callback #'ignore :tool-use (list call))))
+          child)
+     (let ((gptel-otel--request-decision :inhibit))
+       (gptel-otel--instrument-request parent))
+     (should (eq :inhibit (gptel-otel--request-decision-for-fsm parent)))
+     (should-not (gptel-otel--context parent))
+     ;; The adapter must propagate the parent's captured decision, rather than
+     ;; consulting the child task buffer's local option.
+     (let ((gptel-otel--parent-fsm parent)
+           (gptel-otel--next-agent-execution (list parent call nil)))
+       (setq child
+             (gptel-otel--around-agent-task
+              (lambda (_cb &rest _) (gptel-otel-test--fsm))
+              #'ignore "researcher" "desc" "prompt")))
+     (should (eq :inhibit (gptel-otel--request-decision-for-fsm child)))
+     (should-not (gptel-otel--context child)))))
 
 (ert-deftest gptel-otel-group-enqueue-failure-keeps-adapter-state ()
   (gptel-otel-test--isolated

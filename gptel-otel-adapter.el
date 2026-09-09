@@ -8,6 +8,8 @@
 (defvaralias 'gptel-otel--installed-advices 'gptel-otel--base-installed-advices)
 (defvar gptel-otel--base-installed-advices nil)
 (defvar gptel-otel--user-turn nil)
+(defvar gptel-otel--request-decision nil)
+(defvar gptel-otel-inhibit nil)
 (defvar gptel-otel--adapter-capabilities nil)
 (defvar gptel-otel--parent-fsm nil)
 (defvar gptel-otel--agent-bindings)
@@ -113,8 +115,13 @@
     capabilities))
 
 (defun gptel-otel--around-send (orig &rest args)
-  ;; The binding is consumed by the prompt transform invoked within ORIG.
-  (let ((gptel-otel--user-turn t)) (apply orig args)))
+  ;; Capture this in the originating buffer before gptel enters its temporary
+  ;; prompt buffer or asynchronous transforms.  The prompt transform records
+  ;; it on the FSM, which preserves it for the request lifetime.
+  (let ((gptel-otel--user-turn t)
+        (gptel-otel--request-decision
+         (if gptel-otel-inhibit :inhibit :trace)))
+    (apply orig args)))
 
 (defun gptel-otel--around-transition (orig machine &optional new-state)
   "Contain telemetry before and after ORIG without altering its behavior."

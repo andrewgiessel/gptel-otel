@@ -26,6 +26,10 @@
            (gptel-post-request-hook nil))
        (cl-letf (((symbol-function 'gptel-curl-get-response)
                   (lambda (fsm)
+                    ;; Real transport supplies the UI callback when send did
+                    ;; not specify one.  Keep this network stub UI-independent.
+                    (unless (plist-get (gptel-fsm-info fsm) :callback)
+                      (setf (plist-get (gptel-fsm-info fsm) :callback) #'ignore))
                     (push fsm gptel-otel-integration--pending)
                     (gptel--fsm-transition fsm)))
                  ((symbol-function 'gptel-otel-enqueue-spans)
@@ -76,6 +80,48 @@
         (should (= 2 (length gptel-otel-integration--exported)))
         (should (= 1 (length (gptel-otel-integration--named "chat "))))
         (should (= 0 (hash-table-count gptel-otel--contexts)))))))
+
+(ert-deftest gptel-otel-integration-send-inhibition-is-buffer-local-and-inflight-stable ()
+  (gptel-otel-integration--with-request
+    ;; `gptel-send' receives its transform list from this originating buffer.
+    ;; Exercise its real request/FSM pipeline rather than calling lifecycle
+    ;; handlers directly.
+    (setq-local gptel-otel-inhibit t)
+    (gptel-send)
+    (let ((inhibited (car gptel-otel-integration--pending)))
+      (should inhibited)
+      (should-not (gptel-otel--context inhibited))
+      ;; A later local change does not change this already captured decision.
+      (setq-local gptel-otel-inhibit nil)
+      (gptel-otel-integration--respond inhibited "not traced")
+      (should-not gptel-otel-integration--exported))
+    (gptel-send)
+    (let ((traced (car gptel-otel-integration--pending)))
+      (should (gptel-otel--context traced))
+      ;; Conversely, inhibiting the buffer after entry cannot suppress an
+      ;; in-flight trace.
+      (setq-local gptel-otel-inhibit t)
+      (gptel-otel-integration--respond traced "still traced")
+      (should (= 2 (length gptel-otel-integration--exported))))))
+
+(ert-deftest gptel-otel-integration-async-transform-keeps-send-decision ()
+  (gptel-otel-integration--with-request
+    (let (continue)
+      (setq-local gptel-prompt-transform-functions
+                  (list (lambda (callback _fsm) (setq continue callback))
+                        #'gptel-otel--instrument-request))
+      (let ((gptel-otel-inhibit t))
+        (gptel-send))
+      (should continue)
+      ;; The transform callback runs after the dynamic binding has expired.
+      (setq-local gptel-otel-inhibit nil)
+      (funcall continue)
+      (let ((fsm (car gptel-otel-integration--pending)))
+        (should fsm)
+        (should-not (gptel-otel--context fsm))
+        (gptel-otel-integration--respond fsm "not traced")
+        (should-not gptel-otel-integration--exported)))))
+
 
 (ert-deftest gptel-otel-integration-concurrent-requests ()
   (gptel-otel-integration--with-request
@@ -139,6 +185,92 @@
         (should (= 2 (length gptel-otel-integration--exported)))
         (should (cl-every #'gptel-otel-span-ended-p gptel-otel-integration--exported))
         (should (= 0 (hash-table-count gptel-otel--contexts)))))))
+
+(ert-deftest gptel-otel-integration-inhibit-isolates-concurrent-buffers ()
+  (gptel-otel-integration--with-request
+    (setq-local gptel-otel-inhibit t)
+    (gptel-send)
+    (let ((suppressed (car gptel-otel-integration--pending))
+          (backend gptel-backend))
+      (with-temp-buffer
+        (setq-local gptel-backend backend)
+        (setq-local gptel-model 'test-model)
+        (should-not gptel-otel-inhibit)
+        (gptel-send)
+        (let ((traced (car gptel-otel-integration--pending)))
+          (should (gptel-otel--context traced))
+          ;; Finish the inhibited request in a different, non-inhibited buffer.
+          (gptel-otel-integration--respond suppressed "private")
+          (should-not gptel-otel-integration--exported)
+          (gptel-otel-integration--respond traced "public")
+          (should (= 2 (length gptel-otel-integration--exported)))))
+      (should (= 0 (hash-table-count gptel-otel--request-decisions))))))
+
+(ert-deftest gptel-otel-integration-inhibited-send-tool-loop ()
+  (dolist (async '(nil t))
+    (gptel-otel-integration--with-request
+      (let* (continuation
+             (gptel--known-tools nil)
+             (gptel-tools
+              (list (gptel-make-tool
+                     :name "echo" :description "Echo input" :async async
+                     :args '((:name "text" :type string :description "Input"))
+                     :function (if async
+                                   (lambda (cb text)
+                                     (setq continuation (lambda () (funcall cb text))))
+                                 #'identity)))))
+        (setq-local gptel-otel-inhibit t)
+        (gptel-send)
+        (let ((fsm (car gptel-otel-integration--pending)))
+          (setq-local gptel-otel-inhibit nil)
+          (gptel-otel-integration--respond
+           fsm nil (list (list :id "echo-1" :name "echo" :args '(:text "hello"))))
+          (when async
+            (should continuation)
+            (funcall continuation))
+          (should (eq (gptel-fsm-state fsm) 'TYPE))
+          (should-not (gptel-otel--context fsm))
+          (gptel-otel-integration--respond fsm "done")
+          (should (eq (gptel-fsm-state fsm) 'DONE))
+          (should-not gptel-otel-integration--exported)
+          (should (= 0 (hash-table-count gptel-otel--request-decisions))))))))
+
+(ert-deftest gptel-otel-integration-inhibited-agent-inherits-before-and-after-return ()
+  (unless (featurep 'gptel-agent) (ert-skip "gptel-agent is optional"))
+  (dolist (async '(nil t))
+    (gptel-otel-integration--with-request
+      (setq-local gptel-otel-inhibit t)
+      (gptel-send)
+      (let ((parent (car gptel-otel-integration--pending))
+            continue child)
+        (let ((gptel-otel--parent-fsm parent))
+          ;; Exercise real child request/FSM code with the agent adapter.
+          ;; Like gptel-agent--task, use a private transform list rather than
+          ;; the global root hook.  Cover WAIT both before and after return.
+          (setq child
+                (gptel-otel--around-agent-task
+                 (lambda (_cb _type _description prompt)
+                   (gptel-request prompt :callback #'ignore
+                     :transforms (when async
+                                   (list (lambda (cb _fsm) (setq continue cb))))))
+                 #'ignore "test" "child" "hello")))
+        (setq-local gptel-otel-inhibit nil)
+        (when async (funcall continue))
+        (should-not (gptel-otel--context child))
+        (gptel-otel-integration--respond child "child done")
+        (gptel-otel-integration--respond parent "parent done")
+        (should-not gptel-otel-integration--exported)
+        (should (= 0 (hash-table-count gptel-otel--request-decisions)))))))
+
+(ert-deftest gptel-otel-integration-local-option-cannot-enable-global-mode ()
+  (gptel-otel-integration--with-request
+    (gptel-otel-mode -1)
+    (setq-local gptel-otel-inhibit nil)
+    (gptel-send)
+    (let ((fsm (car gptel-otel-integration--pending)))
+      (should-not (gptel-otel--context fsm))
+      (gptel-otel-integration--respond fsm "done")
+      (should-not gptel-otel-integration--exported))))
 
 (provide 'gptel-otel-integration-test)
 ;;; gptel-otel-integration-test.el ends here

@@ -33,6 +33,19 @@
 (defcustom gptel-otel-capture-payloads nil
   "When non-nil retain complete logical inputs and outputs; never truncate."
   :type 'boolean :group 'gptel-otel)
+(defcustom gptel-otel-inhibit nil
+  "When non-nil, do not start tracing gptel sends originating in this buffer.
+This option is automatically buffer-local.  Its value is captured when a
+request starts, so later changes do not affect in-flight requests.  It cannot
+enable tracing while `gptel-otel-mode' is disabled.
+
+Use (setq-local gptel-otel-inhibit t) to suppress new `gptel-send' requests
+from this buffer, or let-bind it around a send for one request.  Tool calls
+and child agents inherit the request's decision.  Previously collected
+telemetry is not removed.  Direct `gptel-request' calls without a send are
+not covered by this option."
+  :type 'boolean :group 'gptel-otel)
+(make-variable-buffer-local 'gptel-otel-inhibit)
 (defcustom gptel-otel-trace-metadata-function #'gptel-otel-default-trace-metadata
   "Function called with FSM, returning generic trace metadata plist.
 Recognized keys are :name, :session-id, :user-id, :tags and :metadata.
@@ -52,6 +65,10 @@ This separates gptel lifecycle capture from backend and semantic conventions."
   trace root current-generation generations tool-spans metadata terminal-p)
 
 (defvar gptel-otel--contexts (make-hash-table :test #'eq))
+;; FSMs own request state; weak keys prevent an abandoned nonterminal FSM from
+;; being retained solely by its captured tracing decision.
+(defvar gptel-otel--request-decisions (make-hash-table :test #'eq :weakness 'key))
+(defvar gptel-otel--request-decision nil)
 (defvar gptel-otel--user-turn nil)
 (defvar gptel-otel--pending-agent nil)
 (defvar gptel-otel--parent-fsm nil)
@@ -255,13 +272,24 @@ Fall back to DATA only when no provider message collection can be identified."
 (defun gptel-otel--context (fsm)
   (gethash fsm gptel-otel--contexts))
 
+(defun gptel-otel--request-decision-for-fsm (fsm)
+  "Return the tracing decision captured for FSM, if any."
+  (gethash fsm gptel-otel--request-decisions))
+
 (defun gptel-otel--instrument-request (fsm)
-  "Establish one trace root for the request represented by FSM."
+  "Capture FSM's tracing decision and establish its trace root when enabled."
   (condition-case err
-      (when (and gptel-otel--user-turn
-                 (not (gptel-otel--context fsm))
-                 (not gptel-otel--pending-agent))
-        (gptel-otel--new-context fsm))
+      (when-let* ((decision (or (gptel-otel--request-decision-for-fsm fsm)
+                                gptel-otel--request-decision
+                                (and gptel-otel--user-turn :trace))))
+        ;; This runs synchronously while gptel starts asynchronous transforms,
+        ;; so later callbacks consult the recorded FSM decision, never their
+        ;; current buffer's local value.
+        (puthash fsm decision gptel-otel--request-decisions)
+        (when (and (eq decision :trace)
+                   (not (gptel-otel--context fsm))
+                   (not gptel-otel--pending-agent))
+          (gptel-otel--new-context fsm)))
     (error (display-warning 'gptel-otel (format "Root instrumentation failed: %s" err) :warning)))
   nil)
 
@@ -292,36 +320,48 @@ Fall back to DATA only when no provider message collection can be identified."
 
 (defun gptel-otel--before-wait (fsm)
   (condition-case err
-      (let* ((parent-context (and gptel-otel--parent-fsm
+      (let* ((decision (or (gptel-otel--request-decision-for-fsm fsm)
+                           gptel-otel--request-decision))
+             ;; Agent children can reach WAIT before their task wrapper has
+             ;; returned.  Record its inherited decision at that synchronous
+             ;; boundary so later lifecycle callbacks are buffer-independent.
+             (_recorded (and decision
+                             (puthash fsm decision gptel-otel--request-decisions)))
+             (parent-context (and gptel-otel--parent-fsm
                                   (gptel-otel--context gptel-otel--parent-fsm)))
              (agent gptel-otel--pending-agent)
              (context (or (gptel-otel--context fsm)
                           (and agent parent-context
                                (gptel-otel--new-context fsm parent-context agent))
-                          (gptel-otel--new-context fsm))))
-        ;; Never silently displace an unended generation on a repeated WAIT.
-        (when-let* ((previous (gptel-otel--context-current-generation context))
-                    ((not (gptel-otel-span-ended-p previous))))
-          (gptel-otel-trace-end-span
-           (gptel-otel--context-trace context) previous
-           (gptel-otel-status-error "Generation replaced before completion"))
-          (setf (gptel-otel--context-current-generation context) nil)
-          (gptel-otel--maybe-export (gptel-otel--context-trace context)))
-        (let* ((info (gptel-fsm-info fsm))
-             (parent (or agent (gptel-otel--context-root context)))
-             (input (plist-get info :data))
-             (attrs (gptel-otel--observation-attributes context "generation" input nil))
-             (model (format "%s" (or (plist-get info :model) "unknown")))
-             (span (gptel-otel-trace-start-span
-                    (gptel-otel--context-trace context)
-                    (format "chat %s" model) parent attrs))
-             (callback (plist-get info :callback)))
-        (setf (gptel-otel--context-current-generation context) span
-              (gptel-otel--context-generations context)
-              (append (gptel-otel--context-generations context) (list span)))
-        (when (functionp callback)
-          (plist-put info :callback
-                     (apply-partially #'gptel-otel--generation-callback span callback)))))
+                          ;; An inhibited request has no context by design.
+                          ;; Do not let an asynchronous lifecycle callback
+                          ;; create one after its originating buffer changed.
+                          (unless (eq decision :inhibit)
+                            (gptel-otel--new-context fsm)))))
+        (when context
+          ;; Never silently displace an unended generation on a repeated WAIT.
+          (when-let* ((previous (gptel-otel--context-current-generation context))
+                      ((not (gptel-otel-span-ended-p previous))))
+            (gptel-otel-trace-end-span
+             (gptel-otel--context-trace context) previous
+             (gptel-otel-status-error "Generation replaced before completion"))
+            (setf (gptel-otel--context-current-generation context) nil)
+            (gptel-otel--maybe-export (gptel-otel--context-trace context)))
+          (let* ((info (gptel-fsm-info fsm))
+                 (parent (or agent (gptel-otel--context-root context)))
+                 (input (plist-get info :data))
+                 (attrs (gptel-otel--observation-attributes context "generation" input nil))
+                 (model (format "%s" (or (plist-get info :model) "unknown")))
+                 (span (gptel-otel-trace-start-span
+                        (gptel-otel--context-trace context)
+                        (format "chat %s" model) parent attrs))
+                 (callback (plist-get info :callback)))
+            (setf (gptel-otel--context-current-generation context) span
+                  (gptel-otel--context-generations context)
+                  (append (gptel-otel--context-generations context) (list span)))
+            (when (functionp callback)
+              (plist-put info :callback
+                         (apply-partially #'gptel-otel--generation-callback span callback))))))
     (error (display-warning 'gptel-otel (format "Generation start failed: %s" err) :warning)))
   nil)
 
@@ -386,7 +426,11 @@ Fall back to DATA only when no provider message collection can be identified."
                                    (gptel-otel-status-error (or (plist-get info :status)
                                                                (format "%s" terminal)))))
         (setf (gptel-otel-trace-terminal-p (gptel-otel--context-trace context)) t)
-        (gptel-otel--maybe-export (gptel-otel--context-trace context))))))
+        (gptel-otel--maybe-export (gptel-otel--context-trace context)))))
+  ;; Inhibited requests have no context to release, but their captured
+  ;; decision must not outlive their terminal FSM.
+  (unless (gptel-otel--context fsm)
+    (remhash fsm gptel-otel--request-decisions)))
 
 (defun gptel-otel--release-trace-state (trace spans)
   "Release completed TRACE and SPANS state after durable enqueue."
@@ -396,7 +440,8 @@ Fall back to DATA only when no provider message collection can be identified."
                           (remhash (plist-get call :args)
                                    gptel-otel--agent-bindings))
                         (gptel-otel--context-tool-spans context))
-               (remhash fsm gptel-otel--contexts)))
+               (remhash fsm gptel-otel--contexts)
+               (remhash fsm gptel-otel--request-decisions)))
            gptel-otel--contexts)
   (dolist (span spans) (remhash span gptel-otel--span-data))
   (setf (gptel-otel-trace-spans trace) nil))

@@ -11,11 +11,14 @@
 (defvar gptel-otel--agent-bindings (make-hash-table :test #'eq))
 (defvar gptel-otel--next-agent-execution nil)
 (defvar gptel-otel--pending-agent nil)
+(defvar gptel-otel--request-decision nil)
+(defvar gptel-otel--request-decisions)
 
 (declare-function gptel-otel--string-attr "gptel-otel")
 (declare-function gptel-otel--set-semantic-attributes "gptel-otel")
 (declare-function gptel-tool-name "gptel")
 (declare-function gptel-otel--context "gptel-otel")
+(declare-function gptel-otel--request-decision-for-fsm "gptel-otel")
 (declare-function gptel-otel--new-context "gptel-otel")
 (declare-function gptel-otel--mode-reconcile-prompt "gptel-otel")
 (declare-function gptel-otel--observation-attributes "gptel-otel")
@@ -100,6 +103,14 @@
          (parent-context (condition-case nil
                              (and parent-fsm (gptel-otel--context parent-fsm))
                            (error nil)))
+         ;; A subagent is part of its invoking request, not a fresh buffer
+         ;; decision.  In particular, a suppressed parent must not create a
+         ;; trace merely because the child runs in a different buffer.
+         (decision (condition-case nil
+                       (and parent-fsm
+                            (or (gptel-otel--request-decision-for-fsm parent-fsm)
+                                (and parent-context :trace)))
+                     (error nil)))
          (tool-span (condition-case nil (nth 2 execution) (error nil)))
          span wrapped child)
     (condition-case nil
@@ -113,7 +124,10 @@
                                          (gptel-otel--string-attr "langfuse.observation.metadata.description" description)))))))
       (error (setq span nil)))
     (setq wrapped (if span (apply-partially #'gptel-otel--agent-callback span parent-context main-cb) main-cb))
-    (let ((gptel-otel--pending-agent span))
+    (let ((gptel-otel--pending-agent span)
+          ;; gptel-agent starts its child synchronously, but bind this as well
+          ;; for any prompt transforms it invokes before returning.
+          (gptel-otel--request-decision decision))
       (condition-case upstream
           (setq child (funcall orig wrapped agent-type description prompt))
         (error
@@ -123,7 +137,14 @@
                                (gptel-otel--maybe-export (gptel-otel--context-trace parent-context)))
                       (error nil)))
          (signal (car upstream) (cdr upstream)))))
-    (when (and span child)
+    (when (and decision child)
+      ;; Child requests use their own transform list, so carry the immutable
+      ;; parent decision explicitly instead of consulting child buffer state.
+      (condition-case nil
+          (unless (memq (gptel-fsm-state child) '(DONE ERRS ABRT))
+            (puthash child decision gptel-otel--request-decisions))
+        (error nil)))
+    (when (and (eq decision :trace) span child)
       (condition-case nil
           (unless (gptel-otel--context child) (gptel-otel--new-context child parent-context span))
         (error nil)))
