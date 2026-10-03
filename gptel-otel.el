@@ -339,6 +339,16 @@ Fall back to DATA only when no provider message collection can be identified."
                           (unless (eq decision :inhibit)
                             (gptel-otel--new-context fsm)))))
         (when context
+          ;; Tool-result handlers can re-enter WAIT synchronously from inside
+          ;; an outer TYPE transition.  Finish that response here as a second,
+          ;; state-checked boundary before starting the next model generation.
+          ;; Do not turn arbitrary repeated WAITs or failed requests into
+          ;; successful generations; those retain the abandonment fallback.
+          (let ((info (gptel-fsm-info fsm)))
+            (when (and (memq (car (plist-get info :history)) '(TRET TSTR))
+                       (not (plist-get info :error))
+                       (gptel-otel--context-current-generation context))
+              (gptel-otel--finish-generation fsm)))
           ;; Never silently displace an unended generation on a repeated WAIT.
           (when-let* ((previous (gptel-otel--context-current-generation context))
                       ((not (gptel-otel-span-ended-p previous))))

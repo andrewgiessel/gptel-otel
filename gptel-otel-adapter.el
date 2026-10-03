@@ -126,19 +126,24 @@
 (defun gptel-otel--around-transition (orig machine &optional new-state)
   "Contain telemetry before and after ORIG without altering its behavior."
   (let ((old-state (condition-case nil (gptel-fsm-state machine) (error nil))) result)
+    ;; Finish this response before destination handlers run.  They can recurse
+    ;; through a tool result into WAIT, whose before-advice starts the next
+    ;; generation before this transition returns.  Never finish the *current*
+    ;; generation after ORIG: it may now belong to that next request.
+    (when (eq old-state 'TYPE)
+      (condition-case telemetry
+          (gptel-otel--finish-generation machine)
+        (error (display-warning 'gptel-otel (format "Transition telemetry failed: %s" telemetry) :warning))))
     (condition-case upstream
         (setq result (funcall orig machine new-state))
       (error
        (condition-case nil
-           (progn (when (eq old-state 'TYPE) (gptel-otel--finish-generation machine))
-                  (gptel-otel--finalize machine 'error))
+           (gptel-otel--finalize machine 'error)
          (error nil))
        (signal (car upstream) (cdr upstream))))
     (condition-case telemetry
-        (progn
-          (when (eq old-state 'TYPE) (gptel-otel--finish-generation machine))
-          (when (memq (gptel-fsm-state machine) '(DONE ERRS ABRT))
-            (gptel-otel--finalize machine (gptel-fsm-state machine))))
+        (when (memq (gptel-fsm-state machine) '(DONE ERRS ABRT))
+          (gptel-otel--finalize machine (gptel-fsm-state machine)))
       (error (display-warning 'gptel-otel (format "Transition telemetry failed: %s" telemetry) :warning)))
     result))
 

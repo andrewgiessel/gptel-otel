@@ -79,6 +79,9 @@
         (should (equal (reverse received) (if stream '("answer" t) '("answer"))))
         (should (= 2 (length gptel-otel-integration--exported)))
         (should (= 1 (length (gptel-otel-integration--named "chat "))))
+        (should (= 1 (cdr (assq 'code
+                                (gptel-otel-span-status
+                                 (car (gptel-otel-integration--named "chat ")))))))
         (should (= 0 (hash-table-count gptel-otel--contexts)))))))
 
 (ert-deftest gptel-otel-integration-send-inhibition-is-buffer-local-and-inflight-stable ()
@@ -169,7 +172,15 @@
         (should (= 2 (length gptel-otel-integration--pending)))
         (gptel-otel-integration--respond fsm "done")
         (should (eq (gptel-fsm-state fsm) 'DONE))
-        (should (= 2 (length (gptel-otel-integration--named "chat "))))
+        (let ((generations (gptel-otel-integration--named "chat ")))
+          (should (= 2 (length generations)))
+          ;; Exercise installed gptel's real TYPE -> TPRE -> TOOL -> TRET ->
+          ;; WAIT recursion: both model generations must finish successfully.
+          (should (cl-every
+                   (lambda (span)
+                     (and (gptel-otel-span-ended-p span)
+                          (= 1 (cdr (assq 'code (gptel-otel-span-status span))))))
+                   generations)))
         (should (= 1 (length (gptel-otel-integration--named "execute_tool "))))
         (should (= 0 (hash-table-count gptel-otel--contexts)))))))
 
@@ -184,7 +195,14 @@
         (should (eq (gptel-fsm-state fsm) terminal))
         (should (= 2 (length gptel-otel-integration--exported)))
         (should (cl-every #'gptel-otel-span-ended-p gptel-otel-integration--exported))
-        (should (= 0 (hash-table-count gptel-otel--contexts)))))))
+        (let ((generation (car (gptel-otel-integration--named "chat ")))
+              (root (car (gptel-otel-integration--named "trace"))))
+          (if (eq terminal 'ERRS)
+              (should (= 2 (cdr (assq 'code (gptel-otel-span-status generation)))))
+            ;; Abort reconciles the in-flight generation and marks the trace
+            ;; root failed; it must not take the normal-success path.
+            (should (= 2 (cdr (assq 'code (gptel-otel-span-status root))))))
+        (should (= 0 (hash-table-count gptel-otel--contexts))))))))
 
 (ert-deftest gptel-otel-integration-inhibit-isolates-concurrent-buffers ()
   (gptel-otel-integration--with-request
