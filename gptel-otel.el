@@ -46,6 +46,22 @@ telemetry is not removed.  Direct `gptel-request' calls without a send are
 not covered by this option."
   :type 'boolean :group 'gptel-otel)
 (make-variable-buffer-local 'gptel-otel-inhibit)
+
+;;;###autoload
+(defun gptel-otel-toggle-inhibit (&optional arg)
+  "Toggle suppression of tracing for new sends from the current buffer.
+With a positive prefix ARG, suppress tracing; with zero or a negative
+prefix ARG, allow tracing.  This does not change `gptel-otel-mode' or
+affect in-flight requests.  Return the new value of `gptel-otel-inhibit'."
+  (interactive "P")
+  (setq-local gptel-otel-inhibit
+              (if arg (> (prefix-numeric-value arg) 0)
+                (not gptel-otel-inhibit)))
+  (when (called-interactively-p 'interactive)
+    (message "gptel tracing %s for new sends in this buffer"
+             (if gptel-otel-inhibit "disabled" "allowed")))
+  gptel-otel-inhibit)
+
 (defcustom gptel-otel-trace-metadata-function #'gptel-otel-default-trace-metadata
   "Function called with FSM, returning generic trace metadata plist.
 Recognized keys are :name, :session-id, :user-id, :tags and :metadata.
